@@ -21,8 +21,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let controller = FloatyWindowController()
         windowController = controller
+        controller.restoreSavedFrameIfAvailable()
         controller.showWindow(nil)
+        controller.restoreSavedFrameIfAvailable()
         controller.window?.makeKeyAndOrderFront(nil)
+        controller.restoreSavedFrameIfAvailable()
         controller.window?.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -60,6 +63,7 @@ final class FloatyWindowController: NSWindowController, NSWindowDelegate {
         panel.hidesOnDeactivate = false
         panel.isFloatingPanel = true
         panel.isMovableByWindowBackground = true
+        panel.isRestorable = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
@@ -83,6 +87,11 @@ final class FloatyWindowController: NSWindowController, NSWindowDelegate {
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func restoreSavedFrameIfAvailable() {
+        guard let frame = Self.savedFrame else { return }
+        window?.setFrame(frame, display: false)
     }
 
     func saveCurrentFrame(flush: Bool = false) {
