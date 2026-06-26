@@ -35,10 +35,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowController?.toggleVisibility()
         return false
     }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        windowController?.saveCurrentFrame(flush: true)
+    }
 }
 
-final class FloatyWindowController: NSWindowController {
-    private static let frameAutosaveName = "FloatyFloatingWidgetFrame"
+final class FloatyWindowController: NSWindowController, NSWindowDelegate {
+    private static let savedFrameKey = "FloatyFloatingWidgetFrame"
 
     init() {
         let panel = NSPanel(
@@ -59,13 +63,13 @@ final class FloatyWindowController: NSWindowController {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
-        panel.setFrameAutosaveName(Self.frameAutosaveName)
         panel.contentViewController = DashboardViewController(windowBridge: AppKitWindowBridge())
         panel.standardWindowButton(.closeButton)?.isHidden = true
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
         panel.standardWindowButton(.zoomButton)?.isHidden = true
 
         super.init(window: panel)
+        panel.delegate = self
     }
 
     func toggleVisibility() {
@@ -81,12 +85,33 @@ final class FloatyWindowController: NSWindowController {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    func saveCurrentFrame(flush: Bool = false) {
+        guard let frame = window?.frame else { return }
+        Self.save(frame: frame, flush: flush)
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        saveCurrentFrame()
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        saveCurrentFrame()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        saveCurrentFrame(flush: true)
+    }
+
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("Storyboard initialization is not used in Floaty.")
     }
 
     private static func defaultFrame() -> NSRect {
+        if let savedFrame {
+            return savedFrame
+        }
+
         let size = NSSize(width: 336, height: 522)
         let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         return NSRect(
@@ -95,5 +120,29 @@ final class FloatyWindowController: NSWindowController {
             width: size.width,
             height: size.height
         )
+    }
+
+    private static var savedFrame: NSRect? {
+        guard let string = UserDefaults.standard.string(forKey: savedFrameKey) else {
+            return nil
+        }
+
+        let frame = NSRectFromString(string)
+        guard frame.width >= 220, frame.height >= 300 else {
+            return nil
+        }
+
+        let visibleFrames = NSScreen.screens.map(\.visibleFrame)
+        guard visibleFrames.contains(where: { $0.intersects(frame) }) else {
+            return nil
+        }
+        return frame
+    }
+
+    private static func save(frame: NSRect, flush: Bool) {
+        UserDefaults.standard.set(NSStringFromRect(frame), forKey: savedFrameKey)
+        if flush {
+            UserDefaults.standard.synchronize()
+        }
     }
 }
