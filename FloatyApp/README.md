@@ -1,79 +1,49 @@
-# FloatyApp MVP Dashboard
+# Floaty
 
-This is a UIKit + Mac Catalyst shell for Floaty MVP Checklist Item D. It renders dashboard state from data shaped like the Rust `DashboardSnapshot` JSON model while keeping the Item A window-command diagnostics visible.
+Floaty is a native macOS floating activity widget for keeping track of local agent work across Codex, Claude Code, OpenCode, and other runners.
 
-The app intentionally avoids SwiftUI, private AppKit/Catalyst APIs, and private local machine paths.
+The current app is intentionally small and glanceable: it opens as a floating `NSPanel`, renders the dashboard in one custom AppKit view, and animates lightweight sparklines so engineers can see where work is happening without opening every terminal or agent UI.
 
 ## What it shows
 
-The dashboard renders snapshot-shaped data for:
-
-- projects and root confidence
-- agent session summaries and source paths
-- minimal Git chips
-- unassigned sessions
-- optional pets
-- core warnings
-- window command diagnostics from `CatalystWindowBridge`
+- active agent count
+- task pressure bars
+- per-agent status rows
+- project/root labels
+- live-ish activity sparklines
+- quick pause, restore, and refresh controls
+- footer totals for completed work, spend, and tokens
 
 ## Current provider
 
-`DashboardViewController` uses `MockDashboardSnapshotProvider`, a local Swift provider that emits JSON with the same keys as `crates/floaty-core`:
+`DashboardViewController` still uses a local mock provider with the same broad shape as the Rust dashboard snapshot. That keeps the UI buildable while the scanner/FFI integration evolves.
 
-- `generated_at`
-- `projects`
-- `unassigned_sessions`
-- `pets`
-- `warnings`
+The mock data is deliberately realistic enough to exercise the widget: multiple tools, mixed project roots, active/idle/needs-input states, warnings, and token/cost totals.
 
-This keeps the Catalyst app buildable without adding Rust cross-compilation/linking steps in Item D. The mock data uses generic `/tmp` paths only.
+## App icon
 
-## Refresh and jump actions
+The app icon lives in `FloatyApp/FloatyApp/Assets.xcassets/AppIcon.appiconset`.
 
-- **Refresh Snapshot** increments the provider version, decodes a fresh JSON snapshot, and updates visible generated time, status, Git dirty state, and warning copy.
-- **Jump to Project** validates that the project root is an existing local directory and then asks UIKit to open the `file://` URL. Missing roots are reported non-fatally in the UI.
-- Window command buttons remain available and continue to report `.supportableAPIUnavailable` for floating/minimize commands when public Catalyst APIs cannot reach `NSWindow`.
+Regenerate the PNG set with:
 
-## Build
+```sh
+swift script/generate_app_icon.swift FloatyApp/FloatyApp/Assets.xcassets/AppIcon.appiconset
+```
+
+## Build and Run
 
 From the repository root:
 
 ```sh
-xcodebuild \
-  -project FloatyApp/FloatyApp.xcodeproj \
-  -scheme FloatyApp \
-  -destination 'platform=macOS,variant=Mac Catalyst' \
-  -derivedDataPath build/FloatyAppDerivedData \
-  CODE_SIGNING_ALLOWED=NO \
-  build
+./script/build_and_run.sh
 ```
 
-## Run / inspect
+Useful modes:
 
-Open `FloatyApp/FloatyApp.xcodeproj` in Xcode, choose **My Mac (Mac Catalyst)**, and run the `FloatyApp` scheme.
+```sh
+./script/build_and_run.sh --verify
+./script/build_and_run.sh --logs
+./script/build_and_run.sh --debug
+```
 
-Suggested smoke check:
-
-1. Confirm the dashboard shows Projects, Unassigned Sessions, Pets, Warnings, and Window Command Diagnostics.
-2. Click **Refresh Snapshot** and confirm the version/generated timestamp and some visible state changes.
-3. Click **Jump to Project** and confirm the UI reports the local open request.
-4. Click the window diagnostic buttons and confirm unsupported window operations are visible instead of crashing.
-
-## Rust FFI next step
-
-The Rust crate already exposes a pull-style C ABI in `crates/floaty-core/include/floaty_core.h`:
-
-- `floaty_core_new`
-- `floaty_core_snapshot_version`
-- `floaty_core_refresh`
-- `floaty_core_snapshot_json`
-- `floaty_core_buffer_free`
-- `floaty_core_free`
-
-The next integration step is to add a Catalyst-linkable build artifact for `floaty-core`, add the header/library to the Xcode target, and replace `MockDashboardSnapshotProvider` with an FFI-backed provider that decodes `floaty_core_snapshot_json` into the same Swift `DashboardSnapshot` models.
-
-## MVP limits
-
-- No Rust library is linked into the Catalyst app yet.
-- The UIKit shell does not scan transcripts, Git repositories, pets, or project roots; those remain Rust responsibilities.
-- Floating/minimize window behavior remains a documented Catalyst supportability limitation in this spike path.
+The Codex Run action is wired to the same script through `.codex/environments/environment.toml`.
