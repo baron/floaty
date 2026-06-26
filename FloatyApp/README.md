@@ -6,11 +6,11 @@ The current app is intentionally small and glanceable: it opens as a floating `N
 
 ## What it shows
 
-- active local agent instance count
+- running, just-finished, and done local agent instance counts
 - projects in motion, sorted by activity
 - per-project Codex and Claude Code instances
 - prompt/session labels from session metadata
-- active/idle status from process state and file modification recency
+- motion-aware status from live process state and file modification changes
 - watched local source roots
 
 ## Current Provider
@@ -21,7 +21,7 @@ The current app is intentionally small and glanceable: it opens as a floating `N
 - `~/.claude/projects`
 - `~/.codex/process_manager/chat_processes.json`
 
-The provider reads bounded metadata from recent JSONL files, groups sessions by project, filters stale/unknown sessions out of the floating UI, and uses Codex process-manager state to identify active Codex instances when possible.
+The provider reads bounded metadata from recent JSONL files, groups sessions by project, filters stale/unknown sessions out of the floating UI, and uses live Codex process-manager pids plus file modification movement to separate in-progress, just-finished, and done work.
 
 ## App icon
 

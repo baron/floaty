@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 
 struct DashboardSnapshot {
     let generatedAt: Date
@@ -28,17 +29,29 @@ struct CoreWarning {
 }
 
 enum StatusHint: String {
-    case active
-    case idle
+    case inProgress
+    case justFinished
+    case done
     case stale
     case unknown
 
     var displayName: String {
         switch self {
-        case .active: return "active"
-        case .idle: return "idle"
+        case .inProgress: return "in progress"
+        case .justFinished: return "just finished"
+        case .done: return "done"
         case .stale: return "stale"
         case .unknown: return "unknown"
+        }
+    }
+
+    var sortRank: Int {
+        switch self {
+        case .inProgress: return 0
+        case .justFinished: return 1
+        case .done: return 2
+        case .stale: return 3
+        case .unknown: return 4
         }
     }
 }
@@ -71,6 +84,7 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
     private let claudeRoot: URL
     private let codexProcessStateURL: URL
     private var cachedSnapshot: DashboardSnapshot?
+    private var previousSessionModifiedDates: [String: Date] = [:]
 
     init(
         fileManager: FileManager = .default,
@@ -119,13 +133,18 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
             lhs.modified > rhs.modified
         }
 
+        let previousModifiedDates = previousSessionModifiedDates
+        previousSessionModifiedDates = Dictionary(uniqueKeysWithValues: files.map { ($0.url.path, $0.modified) })
+
         let recentFiles = Array(files.prefix(80))
         let activeCodexConversations = loadActiveCodexConversations(warnings: &warnings)
-        let sessions = recentFiles.compactMap { file in
-            parseSession(
+        let sessions: [AgentSessionSummary] = recentFiles.compactMap { file in
+            let wasModifiedSinceLastScan = previousModifiedDates[file.url.path].map { file.modified > $0 } ?? false
+            return parseSession(
                 kind: file.kind,
                 url: file.url,
                 modified: file.modified,
+                wasModifiedSinceLastScan: wasModifiedSinceLastScan,
                 activeCodexConversations: activeCodexConversations,
                 warnings: &warnings
             )
@@ -197,6 +216,7 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         kind: AgentKind,
         url: URL,
         modified: Date,
+        wasModifiedSinceLastScan: Bool,
         activeCodexConversations: Set<String>,
         warnings: inout [CoreWarning]
     ) -> AgentSessionSummary? {
@@ -229,9 +249,10 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         var title: String?
         var sessionID: String?
         var parsedLine = false
+        let lines = content.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
 
-        for line in content.split(separator: "\n", omittingEmptySubsequences: true).prefix(220) {
-            guard let object = decodeObject(String(line)) else {
+        for line in lines.prefix(220) {
+            guard let object = decodeObject(line) else {
                 continue
             }
             parsedLine = true
@@ -246,6 +267,11 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
             }
         }
 
+        let latestActivity = lines.reversed().prefix(260).compactMap { line -> String? in
+            guard let object = decodeObject(line) else { return nil }
+            return activitySnippet(in: object)
+        }.first
+
         guard parsedLine else {
             warnings.append(CoreWarning(
                 code: "unknown_schema",
@@ -258,14 +284,17 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         let projectPath = normalizedProjectPath(for: kind, cwd: cwd, fileURL: url)
         let projectName = projectPath.map(Self.displayName(forPath:)) ?? "Unassigned"
         let fallbackTitle = sessionID.map { shortID($0) } ?? url.deletingPathExtension().lastPathComponent
-        let status = kind == .codex && sessionID.map(activeCodexConversations.contains) == true
-            ? StatusHint.active
-            : status(for: modified)
+        let isKnownRunning = kind == .codex && sessionID.map(activeCodexConversations.contains) == true
+        let status = status(
+            for: modified,
+            wasModifiedSinceLastScan: wasModifiedSinceLastScan,
+            isKnownRunning: isKnownRunning
+        )
 
         return AgentSessionSummary(
             agentKind: kind,
             sourcePath: url.path,
-            title: usefulTitle(title) ?? fallbackTitle,
+            title: latestActivity ?? usefulTitle(title) ?? fallbackTitle,
             instanceID: sessionID.map(shortID),
             projectPath: projectPath,
             projectName: projectName,
@@ -293,10 +322,14 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         }
 
         return Set(array.compactMap { entry in
-            guard entry["processId"] != nil || entry["osPid"] != nil else {
+            guard
+                let pid = intValue(entry["osPid"]),
+                isProcessAlive(pid),
+                let conversationID = entry["conversationId"] as? String
+            else {
                 return nil
             }
-            return entry["conversationId"] as? String
+            return conversationID
         })
     }
 
@@ -342,6 +375,181 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         return nil
     }
 
+    private func activitySnippet(in object: [String: Any]) -> String? {
+        if let payload = object["payload"] as? [String: Any],
+           let snippet = codexActivitySnippet(in: payload)
+        {
+            return snippet
+        }
+
+        if let message = object["message"] as? [String: Any],
+           let snippet = messageActivitySnippet(message)
+        {
+            return snippet
+        }
+
+        if let snippet = promptSnippet(in: object) {
+            return snippet
+        }
+
+        if let lastPrompt = object["lastPrompt"] as? String {
+            return cleanActivity(lastPrompt)
+        }
+
+        if let aiTitle = object["aiTitle"] as? String {
+            return cleanActivity(aiTitle)
+        }
+
+        if let type = object["type"] as? String,
+           type == "queue-operation",
+           let content = object["content"] as? String
+        {
+            return cleanActivity(content)
+        }
+
+        return nil
+    }
+
+    private func codexActivitySnippet(in payload: [String: Any]) -> String? {
+        guard let type = payload["type"] as? String else {
+            return messageActivitySnippet(payload)
+        }
+
+        switch type {
+        case "message":
+            return messageActivitySnippet(payload)
+        case "function_call", "custom_tool_call":
+            return toolCallSnippet(name: payload["name"] as? String, arguments: payload["arguments"] ?? payload["input"])
+        case "task_complete":
+            if let message = payload["last_agent_message"] as? String {
+                return cleanActivity("Finished: \(message)")
+            }
+            return "Finished task"
+        case "patch_apply_end":
+            if let success = payload["success"] as? Bool, success {
+                return "Applied code edits"
+            }
+            return "Patch failed"
+        default:
+            return nil
+        }
+    }
+
+    private func messageActivitySnippet(_ message: [String: Any]) -> String? {
+        if let role = message["role"] as? String, role == "system" {
+            return nil
+        }
+
+        if let content = message["content"] as? String {
+            return cleanActivity(content)
+        }
+
+        if let content = message["content"] as? [[String: Any]] {
+            for item in content.reversed() {
+                if let snippet = contentItemSnippet(item) {
+                    return snippet
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func contentItemSnippet(_ item: [String: Any]) -> String? {
+        let type = item["type"] as? String
+        if type == "input_image" || type == "image" || type == "tool_result" {
+            return nil
+        }
+
+        if let text = item["text"] as? String ?? item["input_text"] as? String {
+            return cleanActivity(text)
+        }
+
+        if type == "tool_use" {
+            return toolCallSnippet(name: item["name"] as? String, arguments: item["input"])
+        }
+
+        return nil
+    }
+
+    private func toolCallSnippet(name: String?, arguments: Any?) -> String? {
+        let toolName = name ?? "tool"
+        if toolName == "write_stdin" {
+            return nil
+        }
+
+        if toolName == "view_image" {
+            return "Reviewing screenshot"
+        }
+
+        if let object = argumentsObject(from: arguments) {
+            if let command = object["cmd"] as? String ?? object["command"] as? String {
+                return cleanActivity(commandActivitySnippet(command))
+            }
+
+            if let path = object["path"] as? String ?? object["file_path"] as? String {
+                return cleanActivity("\(toolName) \(URL(fileURLWithPath: path).lastPathComponent)")
+            }
+
+            if let description = object["description"] as? String {
+                return cleanActivity("\(toolName): \(description)")
+            }
+
+            if toolName == "apply_patch" {
+                return "Apply code edits"
+            }
+        }
+
+        if let string = arguments as? String {
+            if toolName == "apply_patch" {
+                return "Apply code edits"
+            }
+            return cleanActivity("\(toolName): \(string)")
+        }
+
+        return cleanActivity("Use \(toolName)")
+    }
+
+    private func argumentsObject(from arguments: Any?) -> [String: Any]? {
+        if let object = arguments as? [String: Any] {
+            return object
+        }
+
+        guard
+            let string = arguments as? String,
+            let data = string.data(using: .utf8)
+        else {
+            return nil
+        }
+
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private func commandActivitySnippet(_ command: String) -> String {
+        let firstLine = command
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .first
+            .map(String.init) ?? command
+        let trimmed = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if trimmed.hasPrefix("xcodebuild") || trimmed.contains(" xcodebuild ") {
+            return "Building app"
+        }
+        if trimmed.hasPrefix("git ") {
+            return trimmed
+        }
+        if trimmed.hasPrefix("screencapture ") {
+            return "Capturing screenshot"
+        }
+        if trimmed.hasPrefix("open ") || trimmed.hasPrefix("osascript ") || trimmed.hasPrefix("pkill ") {
+            return "Managing app launch"
+        }
+        if trimmed.hasPrefix("find ") || trimmed.hasPrefix("tail ") || trimmed.hasPrefix("jq ") || trimmed.hasPrefix("rg ") {
+            return "Inspecting session files"
+        }
+        return "Running \(trimmed)"
+    }
+
     private func normalizedProjectPath(for kind: AgentKind, cwd: String?, fileURL: URL) -> String? {
         if let cwd, fileManager.fileExists(atPath: cwd) {
             return cwd
@@ -363,12 +571,40 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         return encoded.replacingOccurrences(of: "-", with: "/")
     }
 
-    private func status(for modified: Date) -> StatusHint {
+    private func status(
+        for modified: Date,
+        wasModifiedSinceLastScan: Bool,
+        isKnownRunning: Bool
+    ) -> StatusHint {
+        if isKnownRunning || wasModifiedSinceLastScan {
+            return .inProgress
+        }
+
         let age = Date().timeIntervalSince(modified)
-        if age < 5 * 60 { return .active }
-        if age < 2 * 60 * 60 { return .idle }
+        if age < 20 { return .inProgress }
+        if age < 5 * 60 { return .justFinished }
+        if age < 2 * 60 * 60 { return .done }
         if age < 24 * 60 * 60 { return .stale }
         return .unknown
+    }
+
+    private func intValue(_ value: Any?) -> Int? {
+        if let int = value as? Int {
+            return int
+        }
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        if let string = value as? String {
+            return Int(string)
+        }
+        return nil
+    }
+
+    private func isProcessAlive(_ pid: Int) -> Bool {
+        guard pid > 0 else { return false }
+        let result = Darwin.kill(pid_t(pid), 0)
+        return result == 0 || errno == EPERM
     }
 
     private func usefulTitle(_ title: String?) -> String? {
@@ -385,6 +621,10 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
     }
 
     private func cleanPrompt(_ prompt: String) -> String? {
+        cleanActivity(prompt)
+    }
+
+    private func cleanActivity(_ prompt: String) -> String? {
         let cleaned = prompt
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\t", with: " ")
@@ -393,7 +633,10 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         if cleaned.hasPrefix("<environment_context>") || cleaned.hasPrefix("<system") {
             return nil
         }
-        return cleaned.count > 72 ? String(cleaned.prefix(69)) + "..." : cleaned
+        if cleaned.hasPrefix("<image ") || cleaned.contains("data:image") {
+            return nil
+        }
+        return cleaned.count > 92 ? String(cleaned.prefix(89)) + "..." : cleaned
     }
 
     private func shortID(_ id: String) -> String {
@@ -415,13 +658,14 @@ struct ActivityRow {
     let instance: String
     let status: String
     let age: String
-    let isActive: Bool
+    let statusHint: StatusHint
     let lastUpdatedAt: Date
 }
 
 struct ProjectGroup {
     let project: String
-    let activeCount: Int
+    let inProgressCount: Int
+    let justFinishedCount: Int
     let sourceSummary: String
     let environment: ProjectEnvironment
     let rows: [ActivityRow]
@@ -441,7 +685,9 @@ struct ProjectEnvironment {
 }
 
 struct WidgetModel {
-    let activeCount: Int
+    let inProgressCount: Int
+    let justFinishedCount: Int
+    let doneCount: Int
     let sessionCount: Int
     let scannedFileCount: Int
     let recentFileCount: Int
@@ -530,7 +776,7 @@ final class DashboardViewController: NSViewController {
 private extension WidgetModel {
     init(snapshot: DashboardSnapshot) {
         let rows = snapshot.sessions
-            .filter { $0.statusHint == .active || $0.statusHint == .idle }
+            .filter { $0.statusHint == .inProgress || $0.statusHint == .justFinished || $0.statusHint == .done }
             .map { session in
             ActivityRow(
                 source: session.agentKind.displayName,
@@ -540,7 +786,7 @@ private extension WidgetModel {
                 instance: session.instanceID ?? "",
                 status: session.statusHint.displayName,
                 age: Self.relativeAge(since: session.lastUpdatedAt),
-                isActive: session.statusHint == .active,
+                statusHint: session.statusHint,
                 lastUpdatedAt: session.lastUpdatedAt
             )
         }
@@ -548,14 +794,15 @@ private extension WidgetModel {
         let groups = Dictionary(grouping: rows, by: \.project)
             .map { project, rows in
                 let sortedRows = rows.sorted { lhs, rhs in
-                    if lhs.isActive != rhs.isActive {
-                        return lhs.isActive
+                    if lhs.statusHint.sortRank != rhs.statusHint.sortRank {
+                        return lhs.statusHint.sortRank < rhs.statusHint.sortRank
                     }
                     return lhs.lastUpdatedAt > rhs.lastUpdatedAt
                 }
                 return ProjectGroup(
                     project: project,
-                    activeCount: sortedRows.filter(\.isActive).count,
+                    inProgressCount: sortedRows.filter { $0.statusHint == .inProgress }.count,
+                    justFinishedCount: sortedRows.filter { $0.statusHint == .justFinished }.count,
                     sourceSummary: Self.sourceSummary(for: sortedRows),
                     environment: GitEnvironmentReader.snapshot(for: sortedRows.compactMap(\.projectPath).first),
                     rows: Array(sortedRows.prefix(4)),
@@ -563,14 +810,19 @@ private extension WidgetModel {
                 )
             }
             .sorted { lhs, rhs in
-                if lhs.activeCount != rhs.activeCount {
-                    return lhs.activeCount > rhs.activeCount
+                if lhs.inProgressCount != rhs.inProgressCount {
+                    return lhs.inProgressCount > rhs.inProgressCount
+                }
+                if lhs.justFinishedCount != rhs.justFinishedCount {
+                    return lhs.justFinishedCount > rhs.justFinishedCount
                 }
                 return lhs.lastUpdatedAt > rhs.lastUpdatedAt
             }
 
         self.init(
-            activeCount: rows.filter(\.isActive).count,
+            inProgressCount: rows.filter { $0.statusHint == .inProgress }.count,
+            justFinishedCount: rows.filter { $0.statusHint == .justFinished }.count,
+            doneCount: rows.filter { $0.statusHint == .done }.count,
             sessionCount: rows.count,
             scannedFileCount: snapshot.scannedFileCount,
             recentFileCount: snapshot.recentFileCount,
@@ -766,10 +1018,10 @@ final class DashboardWidgetView: NSView {
         drawText("Floaty", rect: NSRect(x: 20, y: 18, width: 95, height: 24), font: .systemFont(ofSize: 17, weight: .semibold), color: Palette.primaryText)
         drawText("local sessions", rect: NSRect(x: 20, y: 40, width: 120, height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: Palette.secondaryText)
 
-        let statusColor = model.activeCount > 0 ? Palette.green : Palette.mutedText
+        let statusColor = headerStatusColor(model)
         statusColor.setFill()
         NSBezierPath(ovalIn: NSRect(x: bounds.width - 106, y: 25, width: 8, height: 8)).fill()
-        drawText("\(model.activeCount) active", rect: NSRect(x: bounds.width - 92, y: 18, width: 74, height: 18), font: .systemFont(ofSize: 13, weight: .semibold), color: Palette.primaryText)
+        drawText(headerStatusLabel(model), rect: NSRect(x: bounds.width - 96, y: 18, width: 78, height: 18), font: .systemFont(ofSize: 13, weight: .semibold), color: Palette.primaryText)
         drawText("\(model.sessionCount) instances", rect: NSRect(x: bounds.width - 102, y: 38, width: 84, height: 16), font: .systemFont(ofSize: 11), color: Palette.secondaryText)
         drawRule(y: 66)
     }
@@ -794,8 +1046,7 @@ final class DashboardWidgetView: NSView {
 
     private func drawGroupHeader(_ group: ProjectGroup, y: CGFloat) {
         drawText(group.project, rect: NSRect(x: 20, y: y, width: 164, height: 18), font: .systemFont(ofSize: 13, weight: .bold), color: Palette.primaryText)
-        let label = group.activeCount > 0 ? "\(group.activeCount) active" : "\(group.rows.count) recent"
-        drawText(label, rect: NSRect(x: bounds.width - 92, y: y + 3, width: 74, height: 15), font: .systemFont(ofSize: 11, weight: .semibold), color: group.activeCount > 0 ? Palette.green : Palette.secondaryText)
+        drawText(groupStatusLabel(group), rect: NSRect(x: bounds.width - 96, y: y + 3, width: 78, height: 15), font: .systemFont(ofSize: 11, weight: .semibold), color: groupStatusColor(group))
 
         let branch = group.environment.branch ?? "no git"
         let context = "\(group.sourceSummary)  \(group.environment.location)  \(branch)"
@@ -804,7 +1055,7 @@ final class DashboardWidgetView: NSView {
     }
 
     private func drawRow(_ row: ActivityRow, y: CGFloat) {
-        let dotColor = row.isActive ? Palette.green : Palette.mutedText
+        let dotColor = statusColor(row.statusHint)
         dotColor.setFill()
         NSBezierPath(ovalIn: NSRect(x: 24, y: y + 12, width: 7, height: 7)).fill()
 
@@ -812,8 +1063,57 @@ final class DashboardWidgetView: NSView {
         drawText(row.age, rect: NSRect(x: bounds.width - 52, y: y + 3, width: 34, height: 17), font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: Palette.secondaryText)
 
         let detail = row.instance.isEmpty ? row.status : "\(row.instance)  \(row.status)"
-        drawText(detail, rect: NSRect(x: 42, y: y + 23, width: bounds.width - 60, height: 15), font: .monospacedSystemFont(ofSize: 10.5, weight: .medium), color: row.isActive ? Palette.green : Palette.secondaryText)
+        drawText(detail, rect: NSRect(x: 42, y: y + 23, width: bounds.width - 60, height: 15), font: .monospacedSystemFont(ofSize: 10.5, weight: .medium), color: statusDetailColor(row.statusHint))
         drawRule(y: y + 43)
+    }
+
+    private func headerStatusLabel(_ model: WidgetModel) -> String {
+        if model.inProgressCount > 0 {
+            return "\(model.inProgressCount) running"
+        }
+        if model.justFinishedCount > 0 {
+            return "\(model.justFinishedCount) finished"
+        }
+        return "\(model.doneCount) done"
+    }
+
+    private func headerStatusColor(_ model: WidgetModel) -> NSColor {
+        if model.inProgressCount > 0 { return Palette.green }
+        if model.justFinishedCount > 0 { return Palette.amber }
+        return Palette.mutedText
+    }
+
+    private func groupStatusLabel(_ group: ProjectGroup) -> String {
+        if group.inProgressCount > 0 {
+            return "\(group.inProgressCount) running"
+        }
+        if group.justFinishedCount > 0 {
+            return "\(group.justFinishedCount) finished"
+        }
+        return "\(group.rows.count) done"
+    }
+
+    private func groupStatusColor(_ group: ProjectGroup) -> NSColor {
+        if group.inProgressCount > 0 { return Palette.green }
+        if group.justFinishedCount > 0 { return Palette.amber }
+        return Palette.secondaryText
+    }
+
+    private func statusColor(_ status: StatusHint) -> NSColor {
+        switch status {
+        case .inProgress: return Palette.green
+        case .justFinished: return Palette.amber
+        case .done: return Palette.mutedText
+        case .stale, .unknown: return Palette.tertiaryText
+        }
+    }
+
+    private func statusDetailColor(_ status: StatusHint) -> NSColor {
+        switch status {
+        case .inProgress: return Palette.green
+        case .justFinished: return Palette.amber
+        case .done, .stale, .unknown: return Palette.secondaryText
+        }
     }
 
     private func drawFooter(_ model: WidgetModel) {
@@ -907,6 +1207,10 @@ private enum Palette {
     static let green = adaptive(
         light: NSColor(calibratedRed: 0.00, green: 0.62, blue: 0.32, alpha: 1),
         dark: NSColor(calibratedRed: 0.25, green: 0.86, blue: 0.50, alpha: 1)
+    )
+    static let amber = adaptive(
+        light: NSColor(calibratedRed: 0.80, green: 0.45, blue: 0.00, alpha: 1),
+        dark: NSColor(calibratedRed: 1.00, green: 0.72, blue: 0.25, alpha: 1)
     )
     static let red = adaptive(
         light: NSColor(calibratedRed: 0.80, green: 0.12, blue: 0.16, alpha: 1),
