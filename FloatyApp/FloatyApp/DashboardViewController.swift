@@ -1,99 +1,56 @@
 import AppKit
 
-struct DashboardSnapshot: Decodable {
-    let generatedAt: String
-    let projects: [ProjectSummary]
-    let unassignedSessions: [AgentSessionSummary]
-    let pets: [PetAssetSummary]
+struct DashboardSnapshot {
+    let generatedAt: Date
+    let sessions: [AgentSessionSummary]
+    let watchedRoots: [String]
+    let scannedFileCount: Int
+    let recentFileCount: Int
     let warnings: [CoreWarning]
 }
 
-struct ProjectSummary: Decodable {
-    let rootPath: String
-    let displayName: String
-    let rootConfidence: RootConfidence
-    let agents: [AgentSessionSummary]
-    let git: GitSummary?
-}
-
-struct AgentSessionSummary: Decodable {
+struct AgentSessionSummary {
     let agentKind: AgentKind
     let sourcePath: String
-    let title: String?
-    let lastUpdatedAt: String
+    let title: String
+    let instanceID: String?
+    let projectPath: String?
+    let projectName: String
+    let lastUpdatedAt: Date
     let statusHint: StatusHint
     let projectRootEvidence: String?
 }
 
-struct GitSummary: Decodable {
-    let branch: String?
-    let dirty: Bool?
-    let aheadCount: UInt?
-    let behindCount: UInt?
-    let lastCheckedAt: String
-    let error: String?
-}
-
-struct PetAssetSummary: Decodable {
-    let petId: String
-    let displayName: String
-    let sourcePath: String
-}
-
-struct CoreWarning: Decodable {
+struct CoreWarning {
     let code: String
     let message: String
     let sourcePath: String?
 }
 
-enum RootConfidence: String, Decodable {
-    case verified
-    case inferred
-    case unknown
-}
-
-enum StatusHint: String, Decodable {
+enum StatusHint: String {
     case active
     case idle
-    case needsInput = "needs_input"
+    case stale
     case unknown
 
     var displayName: String {
         switch self {
-        case .active: return "Running"
-        case .idle: return "Idle"
-        case .needsInput: return "Needs input"
-        case .unknown: return "Checking"
+        case .active: return "active"
+        case .idle: return "idle"
+        case .stale: return "stale"
+        case .unknown: return "unknown"
         }
     }
 }
 
-enum AgentKind: Decodable, Equatable {
+enum AgentKind: Equatable {
     case codex
     case claudeCode
-    case openCode
-    case hermes
-    case other(String)
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        let rawValue = try container.decode(String.self)
-        switch rawValue {
-        case "codex": self = .codex
-        case "claude_code": self = .claudeCode
-        case "open_code": self = .openCode
-        case "hermes": self = .hermes
-        default: self = .other(rawValue)
-        }
-    }
 
     var displayName: String {
         switch self {
         case .codex: return "Codex"
         case .claudeCode: return "Claude"
-        case .openCode: return "OpenCode"
-        case .hermes: return "Hermes"
-        case .other(let value): return value.replacingOccurrences(of: "_", with: " ").capitalized
         }
     }
 }
@@ -105,167 +62,391 @@ protocol DashboardSnapshotProviding {
     @discardableResult func refresh() throws -> UInt64
 }
 
-enum DashboardProviderError: Error, LocalizedError {
-    case invalidMockJSON
+final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
+    private(set) var snapshotVersion: UInt64 = 0
+    let providerName = "Local session files"
 
-    var errorDescription: String? {
-        switch self {
-        case .invalidMockJSON:
-            return "The local Swift mock provider emitted JSON that does not match the dashboard snapshot shape."
-        }
+    private let fileManager: FileManager
+    private let codexRoot: URL
+    private let claudeRoot: URL
+    private let codexProcessStateURL: URL
+    private var cachedSnapshot: DashboardSnapshot?
+
+    init(
+        fileManager: FileManager = .default,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) {
+        self.fileManager = fileManager
+        self.codexRoot = homeDirectory.appendingPathComponent(".codex/sessions", isDirectory: true)
+        self.claudeRoot = homeDirectory.appendingPathComponent(".claude/projects", isDirectory: true)
+        self.codexProcessStateURL = homeDirectory.appendingPathComponent(".codex/process_manager/chat_processes.json")
     }
-}
-
-final class MockDashboardSnapshotProvider: DashboardSnapshotProviding {
-    private(set) var snapshotVersion: UInt64 = 1
-    let providerName = "Local agent activity mock"
 
     func currentSnapshot() throws -> DashboardSnapshot {
-        guard let data = mockSnapshotJSON(version: snapshotVersion).data(using: .utf8) else {
-            throw DashboardProviderError.invalidMockJSON
+        if let cachedSnapshot {
+            return cachedSnapshot
         }
-
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return try decoder.decode(DashboardSnapshot.self, from: data)
+        _ = try refresh()
+        return cachedSnapshot ?? DashboardSnapshot(
+            generatedAt: Date(),
+            sessions: [],
+            watchedRoots: watchedRoots,
+            scannedFileCount: 0,
+            recentFileCount: 0,
+            warnings: []
+        )
     }
 
     @discardableResult
     func refresh() throws -> UInt64 {
         snapshotVersion = snapshotVersion == UInt64.max ? snapshotVersion : snapshotVersion + 1
-        _ = try currentSnapshot()
+        cachedSnapshot = scan()
         return snapshotVersion
     }
 
-    private func mockSnapshotJSON(version: UInt64) -> String {
-        let dirty = version % 2 == 0
-        let second = String(format: "%02d", version % 60)
-        let generatedAt = "2026-06-26T06:42:\(second)Z"
-        let codexStatus = dirty ? "active" : "idle"
+    private var watchedRoots: [String] {
+        [codexRoot.path, claudeRoot.path]
+    }
 
-        return """
-        {
-          "generated_at": "\(generatedAt)",
-          "projects": [
-            {
-              "root_path": "/Users/baron/projects/oss/floaty",
-              "display_name": "Floaty",
-              "root_confidence": "verified",
-              "agents": [
-                {
-                  "agent_kind": "codex",
-                  "source_path": "/Users/baron/.codex/sessions/floaty.jsonl",
-                  "title": "Polish floating widget",
-                  "last_updated_at": "\(generatedAt)",
-                  "status_hint": "\(codexStatus)",
-                  "project_root_evidence": "repo root"
-                },
-                {
-                  "agent_kind": "claude_code",
-                  "source_path": "/Users/baron/.claude/projects/floaty/session.jsonl",
-                  "title": "Review native panel host",
-                  "last_updated_at": "\(generatedAt)",
-                  "status_hint": "active",
-                  "project_root_evidence": "git root"
-                },
-                {
-                  "agent_kind": "open_code",
-                  "source_path": "/tmp/opencode/floaty.log",
-                  "title": "Trace transcript scanner",
-                  "last_updated_at": "\(generatedAt)",
-                  "status_hint": "active",
-                  "project_root_evidence": "cwd"
-                }
-              ],
-              "git": {
-                "branch": "feature/floating-widget",
-                "dirty": \(dirty),
-                "ahead_count": \(version % 4),
-                "behind_count": 0,
-                "last_checked_at": "\(generatedAt)",
-                "error": null
-              }
-            },
-            {
-              "root_path": "/Users/baron/projects/work/revenue-engine",
-              "display_name": "Revenue Engine",
-              "root_confidence": "inferred",
-              "agents": [
-                {
-                  "agent_kind": "hermes",
-                  "source_path": "/tmp/hermes/revenue.log",
-                  "title": "Patch billing smoke test",
-                  "last_updated_at": "\(generatedAt)",
-                  "status_hint": "needs_input",
-                  "project_root_evidence": "prompt path"
-                }
-              ],
-              "git": {
-                "branch": "main",
-                "dirty": false,
-                "ahead_count": 0,
-                "behind_count": 1,
-                "last_checked_at": "\(generatedAt)",
-                "error": null
-              }
-            }
-          ],
-          "unassigned_sessions": [
-            {
-              "agent_kind": "other_agent",
-              "source_path": "/tmp/agent-runner/loose-session.jsonl",
-              "title": "Need project match",
-              "last_updated_at": "\(generatedAt)",
-              "status_hint": "unknown",
-              "project_root_evidence": null
-            }
-          ],
-          "pets": [],
-          "warnings": [
-            {
-              "code": "root_inferred",
-              "message": "One agent session was matched from prompt context instead of a verified working directory.",
-              "source_path": "/tmp/hermes/revenue.log"
-            }
-          ]
+    private func scan() -> DashboardSnapshot {
+        var warnings: [CoreWarning] = []
+        var files: [(kind: AgentKind, url: URL, modified: Date)] = []
+
+        files.append(contentsOf: sessionFiles(in: codexRoot, kind: .codex, warnings: &warnings))
+        files.append(contentsOf: sessionFiles(in: claudeRoot, kind: .claudeCode, warnings: &warnings))
+
+        files.sort { lhs, rhs in
+            lhs.modified > rhs.modified
         }
-        """
+
+        let recentFiles = Array(files.prefix(80))
+        let activeCodexConversations = loadActiveCodexConversations(warnings: &warnings)
+        let sessions = recentFiles.compactMap { file in
+            parseSession(
+                kind: file.kind,
+                url: file.url,
+                modified: file.modified,
+                activeCodexConversations: activeCodexConversations,
+                warnings: &warnings
+            )
+        }
+        .sorted { lhs, rhs in
+            lhs.lastUpdatedAt > rhs.lastUpdatedAt
+        }
+
+        return DashboardSnapshot(
+            generatedAt: Date(),
+            sessions: Array(sessions.prefix(12)),
+            watchedRoots: watchedRoots,
+            scannedFileCount: files.count,
+            recentFileCount: recentFiles.count,
+            warnings: warnings
+        )
+    }
+
+    private func sessionFiles(
+        in root: URL,
+        kind: AgentKind,
+        warnings: inout [CoreWarning]
+    ) -> [(kind: AgentKind, url: URL, modified: Date)] {
+        guard fileManager.fileExists(atPath: root.path) else {
+            warnings.append(CoreWarning(
+                code: "missing_source",
+                message: "Source directory does not exist.",
+                sourcePath: root.path
+            ))
+            return []
+        }
+
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey]
+        guard let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            warnings.append(CoreWarning(
+                code: "unreadable_source",
+                message: "Source directory could not be enumerated.",
+                sourcePath: root.path
+            ))
+            return []
+        }
+
+        var results: [(kind: AgentKind, url: URL, modified: Date)] = []
+        for case let url as URL in enumerator {
+            guard url.pathExtension == "jsonl" || url.pathExtension == "json" else {
+                continue
+            }
+
+            do {
+                let values = try url.resourceValues(forKeys: keys)
+                guard values.isRegularFile == true else { continue }
+                results.append((kind, url, values.contentModificationDate ?? .distantPast))
+            } catch {
+                warnings.append(CoreWarning(
+                    code: "unreadable_file_metadata",
+                    message: "Session file metadata could not be read.",
+                    sourcePath: url.path
+                ))
+            }
+        }
+        return results
+    }
+
+    private func parseSession(
+        kind: AgentKind,
+        url: URL,
+        modified: Date,
+        activeCodexConversations: Set<String>,
+        warnings: inout [CoreWarning]
+    ) -> AgentSessionSummary? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            warnings.append(CoreWarning(
+                code: "unreadable_session",
+                message: "Session file could not be opened.",
+                sourcePath: url.path
+            ))
+            return nil
+        }
+        defer { try? handle.close() }
+
+        let headData = handle.readData(ofLength: 128 * 1024)
+        let fileLength = (try? handle.seekToEnd()) ?? 0
+        let tailOffset = fileLength > 128 * 1024 ? fileLength - UInt64(128 * 1024) : 0
+        try? handle.seek(toOffset: tailOffset)
+        let tailData = handle.readDataToEndOfFile()
+        let data = headData + tailData
+        guard let content = String(data: data, encoding: .utf8), !content.isEmpty else {
+            warnings.append(CoreWarning(
+                code: "empty_session",
+                message: "Session file has no readable UTF-8 metadata.",
+                sourcePath: url.path
+            ))
+            return nil
+        }
+
+        var cwd: String?
+        var title: String?
+        var sessionID: String?
+        var parsedLine = false
+
+        for line in content.split(separator: "\n", omittingEmptySubsequences: true).prefix(220) {
+            guard let object = decodeObject(String(line)) else {
+                continue
+            }
+            parsedLine = true
+            cwd = cwd ?? stringValue(in: object, keys: ["cwd", "project_root", "projectRoot", "workspace", "root_path"])
+            title = usefulTitle(title) ?? promptSnippet(in: object) ?? stringValue(in: object, keys: ["title", "summary", "name", "lastPrompt", "command"])
+            sessionID = sessionID ?? stringValue(in: object, keys: ["session_id", "sessionId", "id", "conversationId"])
+
+            if let payload = object["payload"] as? [String: Any] {
+                cwd = cwd ?? stringValue(in: payload, keys: ["cwd", "project_root", "projectRoot", "workspace", "root_path"])
+                title = usefulTitle(title) ?? promptSnippet(in: payload) ?? stringValue(in: payload, keys: ["title", "summary", "name", "lastPrompt", "command"])
+                sessionID = sessionID ?? stringValue(in: payload, keys: ["session_id", "sessionId", "id", "conversationId"])
+            }
+        }
+
+        guard parsedLine else {
+            warnings.append(CoreWarning(
+                code: "unknown_schema",
+                message: "No JSONL metadata could be parsed from the session file.",
+                sourcePath: url.path
+            ))
+            return nil
+        }
+
+        let projectPath = normalizedProjectPath(for: kind, cwd: cwd, fileURL: url)
+        let projectName = projectPath.map(Self.displayName(forPath:)) ?? "Unassigned"
+        let fallbackTitle = sessionID.map { shortID($0) } ?? url.deletingPathExtension().lastPathComponent
+        let status = kind == .codex && sessionID.map(activeCodexConversations.contains) == true
+            ? StatusHint.active
+            : status(for: modified)
+
+        return AgentSessionSummary(
+            agentKind: kind,
+            sourcePath: url.path,
+            title: usefulTitle(title) ?? fallbackTitle,
+            instanceID: sessionID.map(shortID),
+            projectPath: projectPath,
+            projectName: projectName,
+            lastUpdatedAt: modified,
+            statusHint: status,
+            projectRootEvidence: projectPath == cwd ? "cwd metadata" : "source path"
+        )
+    }
+
+    private func loadActiveCodexConversations(warnings: inout [CoreWarning]) -> Set<String> {
+        guard fileManager.fileExists(atPath: codexProcessStateURL.path) else {
+            return []
+        }
+
+        guard
+            let data = try? Data(contentsOf: codexProcessStateURL),
+            let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else {
+            warnings.append(CoreWarning(
+                code: "process_state_unreadable",
+                message: "Codex process manager state could not be read.",
+                sourcePath: codexProcessStateURL.path
+            ))
+            return []
+        }
+
+        return Set(array.compactMap { entry in
+            guard entry["processId"] != nil || entry["osPid"] != nil else {
+                return nil
+            }
+            return entry["conversationId"] as? String
+        })
+    }
+
+    private func decodeObject(_ line: String) -> [String: Any]? {
+        guard let data = line.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private func stringValue(in object: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = object[key] as? String, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private func promptSnippet(in object: [String: Any]) -> String? {
+        if let role = object["role"] as? String, role != "user" {
+            return nil
+        }
+
+        if let content = object["content"] as? String {
+            return cleanPrompt(content)
+        }
+
+        if let content = object["lastPrompt"] as? String {
+            return cleanPrompt(content)
+        }
+
+        if let content = object["message"] as? String {
+            return cleanPrompt(content)
+        }
+
+        if let content = object["content"] as? [[String: Any]] {
+            for item in content {
+                if let text = item["text"] as? String ?? item["input_text"] as? String {
+                    return cleanPrompt(text)
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func normalizedProjectPath(for kind: AgentKind, cwd: String?, fileURL: URL) -> String? {
+        if let cwd, fileManager.fileExists(atPath: cwd) {
+            return cwd
+        }
+
+        guard kind == .claudeCode else {
+            return cwd
+        }
+
+        let encodedProject = fileURL.deletingLastPathComponent().lastPathComponent
+        let decoded = decodeClaudeProjectPath(encodedProject)
+        return decoded.isEmpty ? cwd : decoded
+    }
+
+    private func decodeClaudeProjectPath(_ encoded: String) -> String {
+        if encoded.hasPrefix("-") {
+            return "/" + encoded.dropFirst().replacingOccurrences(of: "-", with: "/")
+        }
+        return encoded.replacingOccurrences(of: "-", with: "/")
+    }
+
+    private func status(for modified: Date) -> StatusHint {
+        let age = Date().timeIntervalSince(modified)
+        if age < 5 * 60 { return .active }
+        if age < 2 * 60 * 60 { return .idle }
+        if age < 24 * 60 * 60 { return .stale }
+        return .unknown
+    }
+
+    private func usefulTitle(_ title: String?) -> String? {
+        guard let title else { return nil }
+        let trimmed = title
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let lowercased = trimmed.lowercased()
+        guard !["auto", "user", "external", "sdk-cli", "vscode"].contains(lowercased) else {
+            return nil
+        }
+        return trimmed.count > 72 ? String(trimmed.prefix(69)) + "..." : trimmed
+    }
+
+    private func cleanPrompt(_ prompt: String) -> String? {
+        let cleaned = prompt
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return nil }
+        if cleaned.hasPrefix("<environment_context>") || cleaned.hasPrefix("<system") {
+            return nil
+        }
+        return cleaned.count > 72 ? String(cleaned.prefix(69)) + "..." : cleaned
+    }
+
+    private func shortID(_ id: String) -> String {
+        id.count > 10 ? String(id.prefix(8)) : id
+    }
+
+    private static func displayName(forPath path: String) -> String {
+        let url = URL(fileURLWithPath: path)
+        let last = url.lastPathComponent
+        return last.isEmpty ? path : last
     }
 }
 
 struct ActivityRow {
-    let agent: String
+    let source: String
     let project: String
-    let task: String
-    var status: StatusHint
-    var samples: [CGFloat]
-    let iconName: String
+    let title: String
+    let instance: String
+    let status: String
+    let age: String
+    let isActive: Bool
+    let lastUpdatedAt: Date
+}
+
+struct ProjectGroup {
+    let project: String
+    let activeCount: Int
+    let rows: [ActivityRow]
+    let lastUpdatedAt: Date
 }
 
 struct WidgetModel {
-    var activeCount: Int
-    var taskCount: Int
-    var doneCount: Int
-    var costText: String
-    var tokenText: String
-    var bars: [CGFloat]
-    var rows: [ActivityRow]
-    var warningCount: Int
-    var lastEvent: String
+    let activeCount: Int
+    let sessionCount: Int
+    let scannedFileCount: Int
+    let recentFileCount: Int
+    let groups: [ProjectGroup]
+    let watchedRoots: [String]
+    let warningCount: Int
+    let generatedAt: Date
 }
 
 final class DashboardViewController: NSViewController {
-    private let windowBridge: WindowBridge
     private let snapshotProvider: DashboardSnapshotProviding
     private let widgetView = DashboardWidgetView()
-    private var animationTimer: Timer?
-    private var isPaused = false
+    private let scanQueue = DispatchQueue(label: "dev.floaty.session-scan", qos: .utility)
+    private var refreshTimer: Timer?
 
     init(
         windowBridge: WindowBridge,
-        snapshotProvider: DashboardSnapshotProviding = MockDashboardSnapshotProvider()
+        snapshotProvider: DashboardSnapshotProviding = LocalSessionSnapshotProvider()
     ) {
-        self.windowBridge = windowBridge
+        _ = windowBridge
         self.snapshotProvider = snapshotProvider
         super.init(nibName: nil, bundle: nil)
     }
@@ -281,7 +462,7 @@ final class DashboardViewController: NSViewController {
         effectView.blendingMode = .behindWindow
         effectView.state = .active
         effectView.wantsLayer = true
-        effectView.layer?.cornerRadius = 18
+        effectView.layer?.cornerRadius = 16
         effectView.layer?.cornerCurve = .continuous
         effectView.layer?.masksToBounds = true
 
@@ -299,135 +480,106 @@ final class DashboardViewController: NSViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        widgetView.onRefresh = { [weak self] in self?.refreshSnapshot() }
-        widgetView.onPauseToggle = { [weak self] in self?.togglePause() }
-        widgetView.onRestore = { [weak self] in self?.restorePanel() }
-        widgetView.onFloatToggle = { [weak self] in self?.toggleFloatingLevel() }
-        loadSnapshot(reason: "Live")
-        startAnimation()
-    }
-
-    override func viewDidAppear() {
-        super.viewDidAppear()
-        widgetView.windowDiagnostic = windowBridge.describeResolvedWindow(for: view.window).displayText
-    }
-
-    private func startAnimation() {
-        animationTimer?.invalidate()
-        animationTimer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: true) { [weak self] _ in
-            guard let self, !self.isPaused else { return }
-            self.widgetView.advancePulse()
+        refreshSnapshot()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.refreshSnapshot()
         }
-        RunLoop.main.add(animationTimer!, forMode: .common)
-    }
-
-    private func loadSnapshot(reason: String) {
-        do {
-            let snapshot = try snapshotProvider.currentSnapshot()
-            widgetView.model = WidgetModel(snapshot: snapshot, version: snapshotProvider.snapshotVersion, reason: reason)
-        } catch {
-            widgetView.errorMessage = error.localizedDescription
+        if let refreshTimer {
+            RunLoop.main.add(refreshTimer, forMode: .common)
         }
     }
 
     private func refreshSnapshot() {
-        do {
-            let version = try snapshotProvider.refresh()
-            loadSnapshot(reason: "Refresh \(version)")
-        } catch {
-            widgetView.errorMessage = error.localizedDescription
+        scanQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try self.snapshotProvider.refresh()
+                let snapshot = try self.snapshotProvider.currentSnapshot()
+                let model = WidgetModel(snapshot: snapshot)
+                DispatchQueue.main.async {
+                    self.widgetView.model = model
+                    self.widgetView.errorMessage = nil
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.widgetView.errorMessage = error.localizedDescription
+                }
+            }
         }
     }
 
-    private func togglePause() {
-        isPaused.toggle()
-        widgetView.isPaused = isPaused
-    }
-
-    private func restorePanel() {
-        widgetView.windowDiagnostic = windowBridge.activateAndRestore(for: view.window).displayText
-    }
-
-    private func toggleFloatingLevel() {
-        guard let window = view.window else { return }
-        let shouldFloat = window.level != .floating
-        widgetView.windowDiagnostic = windowBridge.setFloating(shouldFloat, for: window).displayText
-    }
-
     deinit {
-        animationTimer?.invalidate()
+        refreshTimer?.invalidate()
     }
 }
 
 private extension WidgetModel {
-    init(snapshot: DashboardSnapshot, version: UInt64, reason: String) {
-        var rows: [ActivityRow] = []
-        for project in snapshot.projects {
-            for session in project.agents {
-                rows.append(ActivityRow(
-                    agent: session.agentKind.displayName,
-                    project: project.displayName,
-                    task: session.title ?? "Untitled task",
-                    status: session.statusHint,
-                    samples: WidgetModel.samples(seed: rows.count + Int(version)),
-                    iconName: WidgetModel.iconName(for: session.agentKind)
-                ))
+    init(snapshot: DashboardSnapshot) {
+        let rows = snapshot.sessions
+            .filter { $0.statusHint == .active || $0.statusHint == .idle }
+            .map { session in
+            ActivityRow(
+                source: session.agentKind.displayName,
+                project: session.projectName,
+                title: session.title,
+                instance: session.instanceID ?? "",
+                status: session.statusHint.displayName,
+                age: Self.relativeAge(since: session.lastUpdatedAt),
+                isActive: session.statusHint == .active,
+                lastUpdatedAt: session.lastUpdatedAt
+            )
+        }
+
+        let groups = Dictionary(grouping: rows, by: \.project)
+            .map { project, rows in
+                let sortedRows = rows.sorted { lhs, rhs in
+                    if lhs.isActive != rhs.isActive {
+                        return lhs.isActive
+                    }
+                    return lhs.lastUpdatedAt > rhs.lastUpdatedAt
+                }
+                return ProjectGroup(
+                    project: project,
+                    activeCount: sortedRows.filter(\.isActive).count,
+                    rows: Array(sortedRows.prefix(4)),
+                    lastUpdatedAt: sortedRows.map(\.lastUpdatedAt).max() ?? .distantPast
+                )
             }
-        }
-
-        for session in snapshot.unassignedSessions {
-            rows.append(ActivityRow(
-                agent: session.agentKind.displayName,
-                project: "Unassigned",
-                task: session.title ?? "Needs project match",
-                status: session.statusHint,
-                samples: WidgetModel.samples(seed: rows.count + Int(version)),
-                iconName: "questionmark.circle"
-            ))
-        }
-
-        let activeCount = rows.filter { $0.status == .active }.count
-        let needsInputCount = rows.filter { $0.status == .needsInput }.count
-        let taskCount = max(1, rows.count * 3 + activeCount + needsInputCount)
-        let doneCount = 29 + Int(version % 7)
-        let cost = 0.08 + Double(version % 9) * 0.013
-        let tokens = 1.0 + Double(taskCount) * 0.08
+            .sorted { lhs, rhs in
+                if lhs.activeCount != rhs.activeCount {
+                    return lhs.activeCount > rhs.activeCount
+                }
+                return lhs.lastUpdatedAt > rhs.lastUpdatedAt
+            }
 
         self.init(
-            activeCount: activeCount,
-            taskCount: taskCount,
-            doneCount: doneCount,
-            costText: String(format: "$%.2f", cost),
-            tokenText: String(format: "%.1fM tokens", tokens),
-            bars: WidgetModel.barSamples(seed: Int(version)),
-            rows: Array(rows.prefix(5)),
+            activeCount: rows.filter(\.isActive).count,
+            sessionCount: rows.count,
+            scannedFileCount: snapshot.scannedFileCount,
+            recentFileCount: snapshot.recentFileCount,
+            groups: groups,
+            watchedRoots: snapshot.watchedRoots,
             warningCount: snapshot.warnings.count,
-            lastEvent: "\(reason) - \(activeCount) active across \(snapshot.projects.count) roots"
+            generatedAt: snapshot.generatedAt
         )
     }
 
-    static func iconName(for agent: AgentKind) -> String {
-        switch agent {
-        case .codex: return "terminal"
-        case .claudeCode: return "sparkles"
-        case .openCode: return "doc.text"
-        case .hermes: return "shield"
-        case .other: return "bubble.left.and.bubble.right"
-        }
+    static func relativeAge(since date: Date) -> String {
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        if seconds < 60 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours)h" }
+        return "\(hours / 24)d"
     }
 
-    static func samples(seed: Int) -> [CGFloat] {
-        (0..<34).map { index in
-            let wave = sin(Double(index + seed) * 0.72) * 0.22
-            let small = sin(Double(index * 3 + seed) * 0.31) * 0.12
-            return CGFloat(min(0.96, max(0.08, 0.44 + wave + small)))
+    static func shortPath(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path.hasPrefix(home) {
+            return "~" + path.dropFirst(home.count)
         }
-    }
-
-    static func barSamples(seed: Int) -> [CGFloat] {
-        (0..<11).map { index in
-            CGFloat(min(1.0, max(0.14, 0.35 + sin(Double(index + seed) * 0.85) * 0.34)))
-        }
+        return path
     }
 }
 
@@ -436,30 +588,11 @@ final class DashboardWidgetView: NSView {
         didSet { needsDisplay = true }
     }
 
-    var isPaused = false {
-        didSet { needsDisplay = true }
-    }
-
     var errorMessage: String? {
         didSet { needsDisplay = true }
     }
 
-    var windowDiagnostic: String? {
-        didSet { needsDisplay = true }
-    }
-
-    var onRefresh: (() -> Void)?
-    var onPauseToggle: (() -> Void)?
-    var onRestore: (() -> Void)?
-    var onFloatToggle: (() -> Void)?
-
-    private var refreshRect = NSRect.zero
-    private var pauseRect = NSRect.zero
-    private var restoreRect = NSRect.zero
-    private var floatRect = NSRect.zero
-
     override var isFlipped: Bool { true }
-    override var acceptsFirstResponder: Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -472,174 +605,109 @@ final class DashboardWidgetView: NSView {
         fatalError("Storyboard initialization is not used in Floaty.")
     }
 
-    func advancePulse() {
-        guard var model else { return }
-        model.bars.removeFirst()
-        model.bars.append(CGFloat.random(in: 0.18...0.94))
-        for index in model.rows.indices {
-            model.rows[index].samples.removeFirst()
-            let base = model.rows[index].status == .active ? CGFloat.random(in: 0.36...0.92) : CGFloat.random(in: 0.08...0.48)
-            model.rows[index].samples.append(base)
-        }
-        self.model = model
-    }
-
     override func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        switch point {
-        case _ where refreshRect.contains(point):
-            onRefresh?()
-        case _ where pauseRect.contains(point):
-            onPauseToggle?()
-        case _ where restoreRect.contains(point):
-            onRestore?()
-        case _ where floatRect.contains(point):
-            onFloatToggle?()
-        default:
-            window?.performDrag(with: event)
-        }
+        window?.performDrag(with: event)
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-
         guard let context = NSGraphicsContext.current?.cgContext else { return }
-        let bounds = bounds.insetBy(dx: 0.5, dy: 0.5)
-        drawChrome(in: bounds, context: context)
 
+        drawChrome(context: context)
         if let errorMessage {
-            drawText("Floaty", rect: NSRect(x: 24, y: 28, width: 160, height: 24), font: .systemFont(ofSize: 18, weight: .semibold), color: Palette.primaryText)
-            drawText(errorMessage, rect: NSRect(x: 24, y: 70, width: bounds.width - 48, height: 80), font: .systemFont(ofSize: 13), color: Palette.warning)
+            drawText("Floaty", rect: NSRect(x: 20, y: 18, width: 120, height: 24), font: .systemFont(ofSize: 17, weight: .semibold), color: Palette.primaryText)
+            drawText(errorMessage, rect: NSRect(x: 20, y: 56, width: bounds.width - 40, height: 80), font: .systemFont(ofSize: 12), color: Palette.warning)
             return
         }
 
-        guard let model else { return }
-        drawHeader(model, context: context)
-        drawWorkload(model, context: context)
-        drawRows(model, context: context)
-        drawComposer(context: context)
-        drawControls(context: context)
-        drawFooter(model, context: context)
+        guard let model else {
+            drawText("Floaty", rect: NSRect(x: 20, y: 18, width: 95, height: 24), font: .systemFont(ofSize: 17, weight: .semibold), color: Palette.primaryText)
+            drawText("scanning local sessions", rect: NSRect(x: 20, y: 46, width: 150, height: 18), font: .systemFont(ofSize: 12, weight: .medium), color: Palette.secondaryText)
+            drawRule(y: 76)
+            drawText("Codex and Claude activity will appear here after the first metadata pass.", rect: NSRect(x: 20, y: 92, width: bounds.width - 40, height: 38), font: .systemFont(ofSize: 11), color: Palette.tertiaryText)
+            return
+        }
+        drawHeader(model)
+        drawSourceSummary(model)
+        drawGroups(model)
+        drawFooter(model)
     }
 
-    private func drawChrome(in rect: NSRect, context: CGContext) {
-        let path = CGPath(roundedRect: rect, cornerWidth: 18, cornerHeight: 18, transform: nil)
+    private func drawChrome(context: CGContext) {
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = CGPath(roundedRect: rect, cornerWidth: 16, cornerHeight: 16, transform: nil)
         context.addPath(path)
         context.setFillColor(Palette.panelFill.cgColor)
         context.fillPath()
-
         context.addPath(path)
         context.setStrokeColor(Palette.hairline.cgColor)
         context.setLineWidth(1)
         context.strokePath()
     }
 
-    private func drawHeader(_ model: WidgetModel, context: CGContext) {
-        drawSymbol("waveform.path.ecg", rect: NSRect(x: 22, y: 20, width: 24, height: 24), color: Palette.secondaryText)
-        drawText("Floaty", rect: NSRect(x: 55, y: 20, width: 110, height: 24), font: .systemFont(ofSize: 17, weight: .semibold), color: Palette.primaryText)
+    private func drawHeader(_ model: WidgetModel) {
+        drawText("Floaty", rect: NSRect(x: 20, y: 18, width: 95, height: 24), font: .systemFont(ofSize: 17, weight: .semibold), color: Palette.primaryText)
+        drawText("local sessions", rect: NSRect(x: 20, y: 40, width: 120, height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: Palette.secondaryText)
 
-        let dotRect = NSRect(x: bounds.width - 141, y: 28, width: 8, height: 8)
-        Palette.green.setFill()
-        NSBezierPath(ovalIn: dotRect).fill()
-        drawText("\(model.activeCount) active", rect: NSRect(x: bounds.width - 126, y: 21, width: 66, height: 20), font: .systemFont(ofSize: 13, weight: .medium), color: Palette.secondaryText)
-
-        floatRect = NSRect(x: bounds.width - 41, y: 17, width: 24, height: 28)
-        drawSymbol("arrow.up.left.and.arrow.down.right", rect: floatRect.insetBy(dx: 3, dy: 4), color: Palette.secondaryText)
-
-        drawRule(y: 57)
-    }
-
-    private func drawWorkload(_ model: WidgetModel, context: CGContext) {
-        let x: CGFloat = 24
-        let baseY: CGFloat = 90
-        let barWidth: CGFloat = 4
-        let gap: CGFloat = 6
-        for (index, value) in model.bars.enumerated() {
-            let height = 10 + value * 27
-            let rect = NSRect(x: x + CGFloat(index) * (barWidth + gap), y: baseY - height, width: barWidth, height: height)
-            let color = index < model.activeCount + 3 ? Palette.green : Palette.mutedStroke
-            drawRounded(rect, radius: 2, color: color.withAlphaComponent(index < 3 ? 0.95 : 0.48))
-        }
-        drawText("\(model.taskCount) tasks running", rect: NSRect(x: 142, y: 73, width: 154, height: 22), font: .systemFont(ofSize: 13, weight: .medium), color: Palette.secondaryText)
-        drawRule(y: 111)
-    }
-
-    private func drawRows(_ model: WidgetModel, context: CGContext) {
-        var y: CGFloat = 116
-        for row in model.rows {
-            drawActivityRow(row, y: y, context: context)
-            y += 56
-        }
-    }
-
-    private func drawActivityRow(_ row: ActivityRow, y: CGFloat, context: CGContext) {
-        drawSymbol(row.iconName, rect: NSRect(x: 22, y: y + 12, width: 25, height: 25), color: Palette.icon)
-        drawText(row.agent, rect: NSRect(x: 61, y: y + 8, width: 92, height: 18), font: .systemFont(ofSize: 13, weight: .semibold), color: Palette.primaryText)
-        drawText(row.status.displayName, rect: NSRect(x: 61, y: y + 28, width: 105, height: 16), font: .systemFont(ofSize: 12), color: Palette.secondaryText)
-        drawText(row.project, rect: NSRect(x: 156, y: y + 9, width: 83, height: 15), font: .systemFont(ofSize: 10, weight: .medium), color: Palette.tertiaryText)
-
-        let statusColor: NSColor = row.status == .needsInput ? Palette.orange : (row.status == .active ? Palette.green : Palette.mutedStroke)
+        let statusColor = model.activeCount > 0 ? Palette.green : Palette.mutedText
         statusColor.setFill()
-        NSBezierPath(ovalIn: NSRect(x: bounds.width - 35, y: y + 15, width: 9, height: 9)).fill()
-
-        drawSparkline(samples: row.samples, rect: NSRect(x: 198, y: y + 29, width: 112, height: 19), color: statusColor, context: context)
-        drawRule(y: y + 55)
+        NSBezierPath(ovalIn: NSRect(x: bounds.width - 106, y: 25, width: 8, height: 8)).fill()
+        drawText("\(model.activeCount) active", rect: NSRect(x: bounds.width - 92, y: 18, width: 74, height: 18), font: .systemFont(ofSize: 13, weight: .semibold), color: Palette.primaryText)
+        drawText("\(model.sessionCount) instances", rect: NSRect(x: bounds.width - 102, y: 38, width: 84, height: 16), font: .systemFont(ofSize: 11), color: Palette.secondaryText)
+        drawRule(y: 68)
     }
 
-    private func drawComposer(context: CGContext) {
-        let rect = NSRect(x: 18, y: bounds.height - 113, width: bounds.width - 36, height: 42)
-        drawRounded(rect, radius: 11, color: Palette.inputFill)
-        strokeRounded(rect, radius: 11, color: Palette.hairline, width: 1)
-        drawText("Ask your agents...", rect: NSRect(x: rect.minX + 13, y: rect.minY + 12, width: rect.width - 54, height: 18), font: .systemFont(ofSize: 13), color: Palette.tertiaryText)
-        drawSymbol("paperplane", rect: NSRect(x: rect.maxX - 34, y: rect.minY + 11, width: 19, height: 19), color: Palette.secondaryText)
+    private func drawSourceSummary(_ model: WidgetModel) {
+        drawText("watching", rect: NSRect(x: 20, y: 78, width: 58, height: 14), font: .systemFont(ofSize: 10, weight: .semibold), color: Palette.tertiaryText)
+        let roots = model.watchedRoots.map(WidgetModel.shortPath).joined(separator: "  ")
+        drawText(roots, rect: NSRect(x: 82, y: 76, width: bounds.width - 102, height: 18), font: .monospacedSystemFont(ofSize: 10, weight: .regular), color: Palette.secondaryText)
+        drawRule(y: 102)
     }
 
-    private func drawControls(context: CGContext) {
-        pauseRect = NSRect(x: 18, y: bounds.height - 61, width: 42, height: 34)
-        restoreRect = NSRect(x: 72, y: bounds.height - 61, width: 42, height: 34)
-        refreshRect = NSRect(x: 126, y: bounds.height - 61, width: 42, height: 34)
+    private func drawGroups(_ model: WidgetModel) {
+        var y: CGFloat = 112
+        var drawnRows = 0
+        for group in model.groups.prefix(4) {
+            drawGroupHeader(group, y: y)
+            y += 22
 
-        drawButton(rect: pauseRect, symbol: isPaused ? "play.fill" : "pause.fill")
-        drawButton(rect: restoreRect, symbol: "arrow.up.forward.app")
-        drawButton(rect: refreshRect, symbol: "arrow.clockwise")
-        drawRule(y: bounds.height - 14)
-    }
-
-    private func drawFooter(_ model: WidgetModel, context: CGContext) {
-        let y = bounds.height - 28
-        drawText("\(model.doneCount) done", rect: NSRect(x: 22, y: y, width: 62, height: 17), font: .systemFont(ofSize: 12, weight: .medium), color: Palette.secondaryText)
-        drawText(" - \(model.costText) - \(model.tokenText)", rect: NSRect(x: 88, y: y, width: 160, height: 17), font: .systemFont(ofSize: 12, weight: .medium), color: Palette.secondaryText)
-        if model.warningCount > 0 {
-            drawText("\(model.warningCount) note", rect: NSRect(x: bounds.width - 72, y: y, width: 50, height: 17), font: .systemFont(ofSize: 12, weight: .medium), color: Palette.orange)
-        }
-    }
-
-    private func drawButton(rect: NSRect, symbol: String) {
-        drawRounded(rect, radius: 9, color: Palette.buttonFill)
-        strokeRounded(rect, radius: 9, color: Palette.hairline, width: 1)
-        drawSymbol(symbol, rect: rect.insetBy(dx: 12, dy: 9), color: Palette.secondaryText)
-    }
-
-    private func drawSparkline(samples: [CGFloat], rect: NSRect, color: NSColor, context: CGContext) {
-        guard samples.count > 1 else { return }
-        context.saveGState()
-        context.setStrokeColor(color.withAlphaComponent(0.78).cgColor)
-        context.setLineWidth(1.35)
-        context.setLineJoin(.round)
-        context.setLineCap(.round)
-
-        let step = rect.width / CGFloat(samples.count - 1)
-        for (index, sample) in samples.enumerated() {
-            let x = rect.minX + CGFloat(index) * step
-            let y = rect.maxY - sample * rect.height
-            if index == 0 {
-                context.move(to: CGPoint(x: x, y: y))
-            } else {
-                context.addLine(to: CGPoint(x: x, y: y))
+            for row in group.rows {
+                guard drawnRows < 7 else { return }
+                drawRow(row, y: y)
+                y += 36
+                drawnRows += 1
             }
         }
-        context.strokePath()
-        context.restoreGState()
+    }
+
+    private func drawGroupHeader(_ group: ProjectGroup, y: CGFloat) {
+        drawText(group.project, rect: NSRect(x: 20, y: y + 2, width: 148, height: 15), font: .systemFont(ofSize: 11, weight: .bold), color: Palette.primaryText)
+        let label = group.activeCount > 0 ? "\(group.activeCount) active" : "\(group.rows.count) recent"
+        drawText(label, rect: NSRect(x: bounds.width - 86, y: y + 2, width: 68, height: 15), font: .systemFont(ofSize: 10, weight: .medium), color: group.activeCount > 0 ? Palette.green : Palette.secondaryText)
+    }
+
+    private func drawRow(_ row: ActivityRow, y: CGFloat) {
+        let dotColor = row.isActive ? Palette.green : Palette.mutedText
+        dotColor.setFill()
+        NSBezierPath(ovalIn: NSRect(x: 24, y: y + 8, width: 6, height: 6)).fill()
+
+        drawText(row.source, rect: NSRect(x: 38, y: y + 1, width: 52, height: 15), font: .systemFont(ofSize: 10, weight: .bold), color: Palette.primaryText)
+        drawText(row.instance, rect: NSRect(x: 94, y: y + 1, width: 42, height: 15), font: .monospacedSystemFont(ofSize: 9, weight: .regular), color: Palette.tertiaryText)
+        drawText(row.status, rect: NSRect(x: 142, y: y + 1, width: 48, height: 15), font: .systemFont(ofSize: 10, weight: .medium), color: row.isActive ? Palette.green : Palette.secondaryText)
+        drawText(row.age, rect: NSRect(x: bounds.width - 48, y: y + 1, width: 30, height: 15), font: .monospacedDigitSystemFont(ofSize: 10, weight: .medium), color: Palette.secondaryText)
+
+        drawText(row.title, rect: NSRect(x: 38, y: y + 17, width: bounds.width - 56, height: 15), font: .systemFont(ofSize: 10), color: Palette.secondaryText)
+        drawRule(y: y + 35)
+    }
+
+    private func drawFooter(_ model: WidgetModel) {
+        let y = bounds.height - 30
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        drawText("updated \(formatter.string(from: model.generatedAt))", rect: NSRect(x: 20, y: y, width: 100, height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: Palette.secondaryText)
+        if model.warningCount > 0 {
+            drawText("\(model.warningCount) warnings", rect: NSRect(x: bounds.width - 92, y: y, width: 74, height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: Palette.warning)
+        }
     }
 
     private func drawRule(y: CGFloat) {
@@ -649,32 +717,6 @@ final class DashboardWidgetView: NSView {
         path.move(to: NSPoint(x: 18, y: y))
         path.line(to: NSPoint(x: bounds.width - 18, y: y))
         path.stroke()
-    }
-
-    private func drawRounded(_ rect: NSRect, radius: CGFloat, color: NSColor) {
-        color.setFill()
-        NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
-    }
-
-    private func strokeRounded(_ rect: NSRect, radius: CGFloat, color: NSColor, width: CGFloat) {
-        color.setStroke()
-        let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
-        path.lineWidth = width
-        path.stroke()
-    }
-
-    private func drawSymbol(_ name: String, rect: NSRect, color: NSColor) {
-        guard let image = NSImage(systemSymbolName: name, accessibilityDescription: nil) else {
-            color.setStroke()
-            NSBezierPath(ovalIn: rect).stroke()
-            return
-        }
-
-        let configuration = NSImage.SymbolConfiguration(pointSize: min(rect.width, rect.height), weight: .regular)
-        let configured = image.withSymbolConfiguration(configuration) ?? image
-        configured.isTemplate = true
-        color.set()
-        configured.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
     }
 
     private func drawText(_ text: String, rect: NSRect, font: NSFont, color: NSColor) {
@@ -690,16 +732,12 @@ final class DashboardWidgetView: NSView {
 }
 
 private enum Palette {
-    static let panelFill = NSColor(calibratedWhite: 0.88, alpha: 0.76)
-    static let inputFill = NSColor(calibratedWhite: 0.99, alpha: 0.58)
-    static let buttonFill = NSColor(calibratedWhite: 0.98, alpha: 0.52)
-    static let hairline = NSColor(calibratedWhite: 0.36, alpha: 0.20)
-    static let primaryText = NSColor(calibratedRed: 0.10, green: 0.12, blue: 0.17, alpha: 1.0)
-    static let secondaryText = NSColor(calibratedRed: 0.24, green: 0.28, blue: 0.36, alpha: 0.92)
-    static let tertiaryText = NSColor(calibratedRed: 0.32, green: 0.37, blue: 0.46, alpha: 0.74)
-    static let mutedStroke = NSColor(calibratedRed: 0.55, green: 0.60, blue: 0.69, alpha: 0.62)
-    static let green = NSColor(calibratedRed: 0.16, green: 0.72, blue: 0.41, alpha: 1)
-    static let orange = NSColor(calibratedRed: 0.96, green: 0.58, blue: 0.12, alpha: 1)
-    static let warning = NSColor(calibratedRed: 0.84, green: 0.36, blue: 0.18, alpha: 1)
-    static let icon = NSColor(calibratedRed: 0.30, green: 0.33, blue: 0.41, alpha: 0.92)
+    static let panelFill = NSColor(calibratedWhite: 0.90, alpha: 0.82)
+    static let hairline = NSColor(calibratedWhite: 0.34, alpha: 0.18)
+    static let primaryText = NSColor(calibratedRed: 0.10, green: 0.12, blue: 0.16, alpha: 1)
+    static let secondaryText = NSColor(calibratedRed: 0.27, green: 0.31, blue: 0.38, alpha: 0.92)
+    static let tertiaryText = NSColor(calibratedRed: 0.36, green: 0.40, blue: 0.48, alpha: 0.74)
+    static let mutedText = NSColor(calibratedRed: 0.55, green: 0.59, blue: 0.66, alpha: 0.9)
+    static let green = NSColor(calibratedRed: 0.12, green: 0.70, blue: 0.38, alpha: 1)
+    static let warning = NSColor(calibratedRed: 0.82, green: 0.36, blue: 0.16, alpha: 1)
 }

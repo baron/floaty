@@ -2,23 +2,26 @@
 
 Floaty is a native macOS floating activity widget for keeping track of local agent work across Codex, Claude Code, OpenCode, and other runners.
 
-The current app is intentionally small and glanceable: it opens as a floating `NSPanel`, renders the dashboard in one custom AppKit view, and animates lightweight sparklines so engineers can see where work is happening without opening every terminal or agent UI.
+The current app is intentionally small and glanceable: it opens as a floating `NSPanel`, scans local agent session metadata, and renders the dashboard in one custom AppKit view so engineers can see where work is happening without opening every terminal or agent UI.
 
 ## What it shows
 
-- active agent count
-- task pressure bars
-- per-agent status rows
-- project/root labels
-- live-ish activity sparklines
-- quick pause, restore, and refresh controls
-- footer totals for completed work, spend, and tokens
+- active local agent instance count
+- projects in motion, sorted by activity
+- per-project Codex and Claude Code instances
+- prompt/session labels from session metadata
+- active/idle status from process state and file modification recency
+- watched local source roots
 
-## Current provider
+## Current Provider
 
-`DashboardViewController` still uses a local mock provider with the same broad shape as the Rust dashboard snapshot. That keeps the UI buildable while the scanner/FFI integration evolves.
+`DashboardViewController` uses `LocalSessionSnapshotProvider`, a read-only provider that scans:
 
-The mock data is deliberately realistic enough to exercise the widget: multiple tools, mixed project roots, active/idle/needs-input states, warnings, and token/cost totals.
+- `~/.codex/sessions`
+- `~/.claude/projects`
+- `~/.codex/process_manager/chat_processes.json`
+
+The provider reads bounded metadata from recent JSONL files, groups sessions by project, filters stale/unknown sessions out of the floating UI, and uses Codex process-manager state to identify active Codex instances when possible.
 
 ## App icon
 
