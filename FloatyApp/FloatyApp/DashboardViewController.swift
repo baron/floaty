@@ -421,6 +421,7 @@ struct ActivityRow {
 struct ProjectGroup {
     let project: String
     let activeCount: Int
+    let sourceSummary: String
     let rows: [ActivityRow]
     let lastUpdatedAt: Date
 }
@@ -431,7 +432,6 @@ struct WidgetModel {
     let scannedFileCount: Int
     let recentFileCount: Int
     let groups: [ProjectGroup]
-    let watchedRoots: [String]
     let warningCount: Int
     let generatedAt: Date
 }
@@ -541,6 +541,7 @@ private extension WidgetModel {
                 return ProjectGroup(
                     project: project,
                     activeCount: sortedRows.filter(\.isActive).count,
+                    sourceSummary: Self.sourceSummary(for: sortedRows),
                     rows: Array(sortedRows.prefix(4)),
                     lastUpdatedAt: sortedRows.map(\.lastUpdatedAt).max() ?? .distantPast
                 )
@@ -558,10 +559,20 @@ private extension WidgetModel {
             scannedFileCount: snapshot.scannedFileCount,
             recentFileCount: snapshot.recentFileCount,
             groups: groups,
-            watchedRoots: snapshot.watchedRoots,
             warningCount: snapshot.warnings.count,
             generatedAt: snapshot.generatedAt
         )
+    }
+
+    static func sourceSummary(for rows: [ActivityRow]) -> String {
+        let counts = Dictionary(grouping: rows, by: \.source).mapValues(\.count)
+        return counts
+            .sorted { lhs, rhs in lhs.key < rhs.key }
+            .map { count in
+                let label = count.value == 1 ? count.key : "\(count.key) x\(count.value)"
+                return label
+            }
+            .joined(separator: ", ")
     }
 
     static func relativeAge(since date: Date) -> String {
@@ -574,13 +585,6 @@ private extension WidgetModel {
         return "\(hours / 24)d"
     }
 
-    static func shortPath(_ path: String) -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        if path.hasPrefix(home) {
-            return "~" + path.dropFirst(home.count)
-        }
-        return path
-    }
 }
 
 final class DashboardWidgetView: NSView {
@@ -609,6 +613,11 @@ final class DashboardWidgetView: NSView {
         window?.performDrag(with: event)
     }
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard let context = NSGraphicsContext.current?.cgContext else { return }
@@ -628,7 +637,6 @@ final class DashboardWidgetView: NSView {
             return
         }
         drawHeader(model)
-        drawSourceSummary(model)
         drawGroups(model)
         drawFooter(model)
     }
@@ -637,10 +645,10 @@ final class DashboardWidgetView: NSView {
         let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
         let path = CGPath(roundedRect: rect, cornerWidth: 16, cornerHeight: 16, transform: nil)
         context.addPath(path)
-        context.setFillColor(Palette.panelFill.cgColor)
+        context.setFillColor(cgColor(for: Palette.panelFill))
         context.fillPath()
         context.addPath(path)
-        context.setStrokeColor(Palette.hairline.cgColor)
+        context.setStrokeColor(cgColor(for: Palette.hairline))
         context.setLineWidth(1)
         context.strokePath()
     }
@@ -654,50 +662,45 @@ final class DashboardWidgetView: NSView {
         NSBezierPath(ovalIn: NSRect(x: bounds.width - 106, y: 25, width: 8, height: 8)).fill()
         drawText("\(model.activeCount) active", rect: NSRect(x: bounds.width - 92, y: 18, width: 74, height: 18), font: .systemFont(ofSize: 13, weight: .semibold), color: Palette.primaryText)
         drawText("\(model.sessionCount) instances", rect: NSRect(x: bounds.width - 102, y: 38, width: 84, height: 16), font: .systemFont(ofSize: 11), color: Palette.secondaryText)
-        drawRule(y: 68)
-    }
-
-    private func drawSourceSummary(_ model: WidgetModel) {
-        drawText("watching", rect: NSRect(x: 20, y: 78, width: 58, height: 14), font: .systemFont(ofSize: 10, weight: .semibold), color: Palette.tertiaryText)
-        let roots = model.watchedRoots.map(WidgetModel.shortPath).joined(separator: "  ")
-        drawText(roots, rect: NSRect(x: 82, y: 76, width: bounds.width - 102, height: 18), font: .monospacedSystemFont(ofSize: 10, weight: .regular), color: Palette.secondaryText)
-        drawRule(y: 102)
+        drawRule(y: 66)
     }
 
     private func drawGroups(_ model: WidgetModel) {
-        var y: CGFloat = 112
+        var y: CGFloat = 78
         var drawnRows = 0
+        let footerTop = bounds.height - 42
         for group in model.groups.prefix(4) {
+            guard y + 30 < footerTop else { return }
             drawGroupHeader(group, y: y)
-            y += 22
+            y += 30
 
             for row in group.rows {
-                guard drawnRows < 7 else { return }
+                guard drawnRows < 7, y + 44 < footerTop else { return }
                 drawRow(row, y: y)
-                y += 36
+                y += 44
                 drawnRows += 1
             }
         }
     }
 
     private func drawGroupHeader(_ group: ProjectGroup, y: CGFloat) {
-        drawText(group.project, rect: NSRect(x: 20, y: y + 2, width: 148, height: 15), font: .systemFont(ofSize: 11, weight: .bold), color: Palette.primaryText)
+        drawText(group.project, rect: NSRect(x: 20, y: y, width: 168, height: 16), font: .systemFont(ofSize: 12, weight: .bold), color: Palette.primaryText)
+        drawText(group.sourceSummary, rect: NSRect(x: 20, y: y + 16, width: 170, height: 13), font: .systemFont(ofSize: 10.5, weight: .medium), color: Palette.secondaryText)
         let label = group.activeCount > 0 ? "\(group.activeCount) active" : "\(group.rows.count) recent"
-        drawText(label, rect: NSRect(x: bounds.width - 86, y: y + 2, width: 68, height: 15), font: .systemFont(ofSize: 10, weight: .medium), color: group.activeCount > 0 ? Palette.green : Palette.secondaryText)
+        drawText(label, rect: NSRect(x: bounds.width - 92, y: y + 3, width: 74, height: 15), font: .systemFont(ofSize: 11, weight: .semibold), color: group.activeCount > 0 ? Palette.green : Palette.secondaryText)
     }
 
     private func drawRow(_ row: ActivityRow, y: CGFloat) {
         let dotColor = row.isActive ? Palette.green : Palette.mutedText
         dotColor.setFill()
-        NSBezierPath(ovalIn: NSRect(x: 24, y: y + 8, width: 6, height: 6)).fill()
+        NSBezierPath(ovalIn: NSRect(x: 24, y: y + 12, width: 7, height: 7)).fill()
 
-        drawText(row.source, rect: NSRect(x: 38, y: y + 1, width: 52, height: 15), font: .systemFont(ofSize: 10, weight: .bold), color: Palette.primaryText)
-        drawText(row.instance, rect: NSRect(x: 94, y: y + 1, width: 42, height: 15), font: .monospacedSystemFont(ofSize: 9, weight: .regular), color: Palette.tertiaryText)
-        drawText(row.status, rect: NSRect(x: 142, y: y + 1, width: 48, height: 15), font: .systemFont(ofSize: 10, weight: .medium), color: row.isActive ? Palette.green : Palette.secondaryText)
-        drawText(row.age, rect: NSRect(x: bounds.width - 48, y: y + 1, width: 30, height: 15), font: .monospacedDigitSystemFont(ofSize: 10, weight: .medium), color: Palette.secondaryText)
+        drawText(row.title, rect: NSRect(x: 42, y: y + 3, width: bounds.width - 96, height: 17), font: .systemFont(ofSize: 12, weight: .medium), color: Palette.primaryText)
+        drawText(row.age, rect: NSRect(x: bounds.width - 52, y: y + 3, width: 34, height: 17), font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), color: Palette.secondaryText)
 
-        drawText(row.title, rect: NSRect(x: 38, y: y + 17, width: bounds.width - 56, height: 15), font: .systemFont(ofSize: 10), color: Palette.secondaryText)
-        drawRule(y: y + 35)
+        let detail = row.instance.isEmpty ? row.status : "\(row.instance)  \(row.status)"
+        drawText(detail, rect: NSRect(x: 42, y: y + 23, width: bounds.width - 60, height: 15), font: .monospacedSystemFont(ofSize: 10.5, weight: .medium), color: row.isActive ? Palette.green : Palette.secondaryText)
+        drawRule(y: y + 43)
     }
 
     private func drawFooter(_ model: WidgetModel) {
@@ -729,15 +732,51 @@ final class DashboardWidgetView: NSView {
         ]
         (text as NSString).draw(in: rect, withAttributes: attributes)
     }
+
+    private func cgColor(for color: NSColor) -> CGColor {
+        var output = color.cgColor
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            output = color.cgColor
+        }
+        return output
+    }
 }
 
 private enum Palette {
-    static let panelFill = NSColor(calibratedWhite: 0.90, alpha: 0.82)
-    static let hairline = NSColor(calibratedWhite: 0.34, alpha: 0.18)
-    static let primaryText = NSColor(calibratedRed: 0.10, green: 0.12, blue: 0.16, alpha: 1)
-    static let secondaryText = NSColor(calibratedRed: 0.27, green: 0.31, blue: 0.38, alpha: 0.92)
-    static let tertiaryText = NSColor(calibratedRed: 0.36, green: 0.40, blue: 0.48, alpha: 0.74)
-    static let mutedText = NSColor(calibratedRed: 0.55, green: 0.59, blue: 0.66, alpha: 0.9)
-    static let green = NSColor(calibratedRed: 0.12, green: 0.70, blue: 0.38, alpha: 1)
-    static let warning = NSColor(calibratedRed: 0.82, green: 0.36, blue: 0.16, alpha: 1)
+    static let panelFill = adaptive(
+        light: NSColor(calibratedWhite: 0.94, alpha: 0.90),
+        dark: NSColor(calibratedWhite: 0.11, alpha: 0.88)
+    )
+    static let hairline = adaptive(
+        light: NSColor(calibratedWhite: 0.26, alpha: 0.20),
+        dark: NSColor(calibratedWhite: 1.00, alpha: 0.18)
+    )
+    static let primaryText = NSColor.labelColor
+    static let secondaryText = adaptive(
+        light: NSColor(calibratedRed: 0.24, green: 0.28, blue: 0.34, alpha: 0.96),
+        dark: NSColor(calibratedWhite: 0.82, alpha: 0.94)
+    )
+    static let tertiaryText = adaptive(
+        light: NSColor(calibratedRed: 0.33, green: 0.37, blue: 0.44, alpha: 0.88),
+        dark: NSColor(calibratedWhite: 0.70, alpha: 0.90)
+    )
+    static let mutedText = adaptive(
+        light: NSColor(calibratedRed: 0.46, green: 0.51, blue: 0.58, alpha: 0.95),
+        dark: NSColor(calibratedWhite: 0.58, alpha: 0.92)
+    )
+    static let green = adaptive(
+        light: NSColor(calibratedRed: 0.00, green: 0.62, blue: 0.32, alpha: 1),
+        dark: NSColor(calibratedRed: 0.25, green: 0.86, blue: 0.50, alpha: 1)
+    )
+    static let warning = adaptive(
+        light: NSColor.systemOrange,
+        dark: NSColor.systemYellow
+    )
+
+    private static func adaptive(light: NSColor, dark: NSColor) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let match = appearance.bestMatch(from: [.darkAqua, .aqua])
+            return match == .darkAqua ? dark : light
+        }
+    }
 }
