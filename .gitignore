@@ -36,7 +36,6 @@ Package.resolved
 # Rust
 /target/
 **/target/
-Cargo.lock
 
 # Editors / IDEs
 .vscode/

@@ -148,6 +148,12 @@ Do not watch `.git` directories until project roots are verified and Git summari
 9. **OpenCode and Hermes discovery.** Validate OpenCode’s best source, then implement it. Keep Hermes deferred until storage/export behavior is known.
 10. **Package and measure.** Add launch/idle/update measurements, watcher stress checks, memory targets, and a direct-download signing/notarization investigation.
 
+## MVP Orchestration Checklist
+- [x] Item A — Catalyst window feasibility spike: added a minimal UIKit/Mac Catalyst app that builds; it represents floating/minimize/activation commands and documents graceful `.supportableAPIUnavailable` results for public `NSWindow` floating/minimize APIs in Catalyst.
+- [x] Item B — Rust local core skeleton: created the Rust workspace/crate with snapshot types, mocked snapshot generation, pull-style FFI functions, and tests (`cargo test -p floaty-core` passes).
+- [x] Item C — Source discovery/adapters: added read-only fixture-tested discovery for configured roots, Codex/Claude sessions, optional pets, root-confidence handling, unassigned sessions, and warnings (`cargo test -p floaty-core` passes).
+- [x] Item D — MVP dashboard integration: render snapshot data in the UIKit shell, wire refresh/jump actions, document build/run steps, and keep code free of private local paths (`xcodebuild` Mac Catalyst build passes).
+
 ## Error Handling and Privacy
 - Default to local-only operation with no network dependency.
 - Treat transcript inputs as private and read-only.
