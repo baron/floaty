@@ -38,6 +38,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 final class FloatyWindowController: NSWindowController {
+    private static let frameAutosaveName = "FloatyFloatingWidgetFrame"
+
     init() {
         let panel = NSPanel(
             contentRect: FloatyWindowController.defaultFrame(),
@@ -57,6 +59,7 @@ final class FloatyWindowController: NSWindowController {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
+        panel.setFrameAutosaveName(Self.frameAutosaveName)
         panel.contentViewController = DashboardViewController(windowBridge: AppKitWindowBridge())
         panel.standardWindowButton(.closeButton)?.isHidden = true
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
