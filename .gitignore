@@ -1,0 +1,84 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Xcode / Apple platforms
+DerivedData/
+build/
+Build/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.playground/xcuserdata/
+*.hmap
+*.ipa
+*.dSYM/
+*.dSYM.zip
+*.app
+*.appex
+*.pkg
+*.xcarchive
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Rust
+/target/
+**/target/
+Cargo.lock
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment, credentials, and local config
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.crt
+*.p12
+*.mobileprovision
+*.provisionprofile
+*.token
+*.secret
+secrets/
+private/
+.local/
+
+# Local agent/session data: never commit transcripts or personal state
+.codex/
+.claude/
+.opencode/
+.hermes/
+prompt-exports/
+*.jsonl
+*.log
+
+# Generated reports and coverage
+coverage/
+*.profraw
+*.profdata
+
+# Archives and temporary files
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tmp
+*.bak
