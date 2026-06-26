@@ -46,6 +46,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 final class FloatyWindowController: NSWindowController, NSWindowDelegate {
     private static let savedFrameKey = "FloatyFloatingWidgetFrame"
+    private static let savedScreenIDKey = "FloatyFloatingWidgetScreenID"
+    private static let savedOffsetXKey = "FloatyFloatingWidgetOffsetX"
+    private static let savedOffsetFromTopKey = "FloatyFloatingWidgetOffsetFromTop"
+    private static let savedWidthKey = "FloatyFloatingWidgetWidth"
+    private static let savedHeightKey = "FloatyFloatingWidgetHeight"
 
     init() {
         let panel = NSPanel(
@@ -132,6 +137,10 @@ final class FloatyWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private static var savedFrame: NSRect? {
+        if let placementFrame = savedScreenRelativeFrame {
+            return placementFrame
+        }
+
         guard let string = UserDefaults.standard.string(forKey: savedFrameKey) else {
             return nil
         }
@@ -149,9 +158,65 @@ final class FloatyWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private static func save(frame: NSRect, flush: Bool) {
+        let defaults = UserDefaults.standard
         UserDefaults.standard.set(NSStringFromRect(frame), forKey: savedFrameKey)
+        if let screen = bestScreen(for: frame) {
+            let visibleFrame = screen.visibleFrame
+            defaults.set(screenID(for: screen), forKey: savedScreenIDKey)
+            defaults.set(frame.minX - visibleFrame.minX, forKey: savedOffsetXKey)
+            defaults.set(visibleFrame.maxY - frame.maxY, forKey: savedOffsetFromTopKey)
+            defaults.set(frame.width, forKey: savedWidthKey)
+            defaults.set(frame.height, forKey: savedHeightKey)
+        }
         if flush {
             UserDefaults.standard.synchronize()
         }
+    }
+
+    private static var savedScreenRelativeFrame: NSRect? {
+        let defaults = UserDefaults.standard
+        let screenID = defaults.integer(forKey: savedScreenIDKey)
+        guard
+            screenID != 0,
+            let screen = NSScreen.screens.first(where: { self.screenID(for: $0) == screenID })
+        else {
+            return nil
+        }
+
+        let width = defaults.double(forKey: savedWidthKey)
+        let height = defaults.double(forKey: savedHeightKey)
+        guard width >= 220, height >= 300 else {
+            return nil
+        }
+
+        let visibleFrame = screen.visibleFrame
+        let maxX = max(visibleFrame.minX, visibleFrame.maxX - width)
+        let maxY = max(visibleFrame.minY, visibleFrame.maxY - height)
+        let offsetX = defaults.double(forKey: savedOffsetXKey)
+        let offsetFromTop = defaults.double(forKey: savedOffsetFromTopKey)
+        let x = min(max(visibleFrame.minX + offsetX, visibleFrame.minX), maxX)
+        let y = min(max(visibleFrame.maxY - offsetFromTop - height, visibleFrame.minY), maxY)
+        return NSRect(x: x, y: y, width: width, height: height)
+    }
+
+    private static func bestScreen(for frame: NSRect) -> NSScreen? {
+        let center = NSPoint(x: frame.midX, y: frame.midY)
+        if let containingScreen = NSScreen.screens.first(where: { $0.visibleFrame.contains(center) }) {
+            return containingScreen
+        }
+
+        return NSScreen.screens.max { lhs, rhs in
+            intersectionArea(lhs.visibleFrame, frame) < intersectionArea(rhs.visibleFrame, frame)
+        }
+    }
+
+    private static func intersectionArea(_ lhs: NSRect, _ rhs: NSRect) -> CGFloat {
+        let intersection = lhs.intersection(rhs)
+        guard !intersection.isNull else { return 0 }
+        return intersection.width * intersection.height
+    }
+
+    private static func screenID(for screen: NSScreen) -> Int {
+        screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? Int ?? 0
     }
 }
