@@ -136,31 +136,71 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         let previousModifiedDates = previousSessionModifiedDates
         previousSessionModifiedDates = Dictionary(uniqueKeysWithValues: files.map { ($0.url.path, $0.modified) })
 
-        let recentFiles = Array(files.prefix(80))
-        let activeCodexConversations = loadActiveCodexConversations(warnings: &warnings)
-        let sessions: [AgentSessionSummary] = recentFiles.compactMap { file in
+        let activeCodexProjects = loadActiveCodexProjects(warnings: &warnings)
+        let candidateFiles = sessionCandidates(
+            from: files,
+            activeCodexConversations: Set(activeCodexProjects.keys),
+            limit: 12
+        )
+        let sessions: [AgentSessionSummary] = candidateFiles.compactMap { file in
             let wasModifiedSinceLastScan = previousModifiedDates[file.url.path].map { file.modified > $0 } ?? false
             return parseSession(
                 kind: file.kind,
                 url: file.url,
                 modified: file.modified,
                 wasModifiedSinceLastScan: wasModifiedSinceLastScan,
-                activeCodexConversations: activeCodexConversations,
+                activeCodexProjects: activeCodexProjects,
                 warnings: &warnings
             )
         }
-        .sorted { lhs, rhs in
-            lhs.lastUpdatedAt > rhs.lastUpdatedAt
-        }
+        .sorted(by: Self.sessionPrioritySort)
 
         return DashboardSnapshot(
             generatedAt: Date(),
-            sessions: Array(sessions.prefix(12)),
+            sessions: Array(sessions.prefix(16)),
             watchedRoots: watchedRoots,
             scannedFileCount: files.count,
-            recentFileCount: recentFiles.count,
+            recentFileCount: candidateFiles.count,
             warnings: warnings
         )
+    }
+
+    private func sessionCandidates(
+        from files: [(kind: AgentKind, url: URL, modified: Date)],
+        activeCodexConversations: Set<String>,
+        limit: Int
+    ) -> [(kind: AgentKind, url: URL, modified: Date)] {
+        var seen = Set<String>()
+        var candidates: [(kind: AgentKind, url: URL, modified: Date)] = []
+
+        func append(_ file: (kind: AgentKind, url: URL, modified: Date)) {
+            guard seen.insert(file.url.path).inserted else { return }
+            candidates.append(file)
+        }
+
+        for file in files.prefix(limit) {
+            append(file)
+        }
+
+        guard !activeCodexConversations.isEmpty else {
+            return candidates
+        }
+
+        for file in files where file.kind == .codex {
+            let filename = file.url.lastPathComponent
+            if activeCodexConversations.contains(where: { filename.contains($0) }) {
+                append(file)
+            }
+        }
+
+        return candidates
+    }
+
+    private static func sessionPrioritySort(_ lhs: AgentSessionSummary, _ rhs: AgentSessionSummary) -> Bool {
+        if lhs.statusHint.sortRank != rhs.statusHint.sortRank {
+            return lhs.statusHint.sortRank < rhs.statusHint.sortRank
+        }
+        return lhs.lastUpdatedAt > rhs.lastUpdatedAt
     }
 
     private func sessionFiles(
@@ -217,7 +257,7 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         url: URL,
         modified: Date,
         wasModifiedSinceLastScan: Bool,
-        activeCodexConversations: Set<String>,
+        activeCodexProjects: [String: String],
         warnings: inout [CoreWarning]
     ) -> AgentSessionSummary? {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
@@ -230,9 +270,11 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         }
         defer { try? handle.close() }
 
-        let headData = handle.readData(ofLength: 128 * 1024)
+        let headWindow = UInt64(64 * 1024)
+        let tailWindow = UInt64(16 * 1024)
+        let headData = handle.readData(ofLength: Int(headWindow))
         let fileLength = (try? handle.seekToEnd()) ?? 0
-        let tailOffset = fileLength > 128 * 1024 ? fileLength - UInt64(128 * 1024) : 0
+        let tailOffset = fileLength > tailWindow ? fileLength - tailWindow : 0
         try? handle.seek(toOffset: tailOffset)
         let tailData = handle.readDataToEndOfFile()
         let data = headData + tailData
@@ -249,9 +291,9 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         var title: String?
         var sessionID: String?
         var parsedLine = false
-        let lines = content.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
 
-        for line in lines.prefix(220) {
+        for line in lines.prefix(50) {
             guard let object = decodeObject(line) else {
                 continue
             }
@@ -267,10 +309,22 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
             }
         }
 
-        let latestActivity = lines.reversed().prefix(260).compactMap { line -> String? in
+        if shouldReplaceSessionID(sessionID), let fileConversationID = conversationID(in: url) {
+            sessionID = fileConversationID
+        }
+
+        if kind == .codex,
+           let sessionID,
+           let activeProject = activeCodexProjects[sessionID],
+           !activeProject.isEmpty
+        {
+            cwd = cwd == "/" ? activeProject : cwd ?? activeProject
+        }
+
+        let recentActivities = lines.reversed().prefix(40).compactMap { line -> String? in
             guard let object = decodeObject(line) else { return nil }
             return activitySnippet(in: object)
-        }.first
+        }
 
         guard parsedLine else {
             warnings.append(CoreWarning(
@@ -284,12 +338,15 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         let projectPath = normalizedProjectPath(for: kind, cwd: cwd, fileURL: url)
         let projectName = projectPath.map(Self.displayName(forPath:)) ?? "Unassigned"
         let fallbackTitle = sessionID.map { shortID($0) } ?? url.deletingPathExtension().lastPathComponent
-        let isKnownRunning = kind == .codex && sessionID.map(activeCodexConversations.contains) == true
+        let isKnownRunning = kind == .codex && sessionID.map { activeCodexProjects[$0] != nil } == true
         let status = status(
             for: modified,
             wasModifiedSinceLastScan: wasModifiedSinceLastScan,
             isKnownRunning: isKnownRunning
         )
+        let latestActivity = status == .inProgress
+            ? recentActivities.first { !$0.hasPrefix("Finished:") } ?? recentActivities.first
+            : recentActivities.first
 
         return AgentSessionSummary(
             agentKind: kind,
@@ -304,9 +361,9 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         )
     }
 
-    private func loadActiveCodexConversations(warnings: inout [CoreWarning]) -> Set<String> {
+    private func loadActiveCodexProjects(warnings: inout [CoreWarning]) -> [String: String] {
         guard fileManager.fileExists(atPath: codexProcessStateURL.path) else {
-            return []
+            return [:]
         }
 
         guard
@@ -318,22 +375,33 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
                 message: "Codex process manager state could not be read.",
                 sourcePath: codexProcessStateURL.path
             ))
-            return []
+            return [:]
         }
 
-        return Set(array.compactMap { entry in
+        var projects: [String: String] = [:]
+        for entry in array {
             guard
                 let pid = intValue(entry["osPid"]),
                 isProcessAlive(pid),
                 let conversationID = entry["conversationId"] as? String
             else {
-                return nil
+                continue
             }
-            return conversationID
-        })
+            let cwd = (entry["cwd"] as? String).flatMap { $0 == "/" ? nil : $0 } ?? ""
+            if projects[conversationID, default: ""].isEmpty || !cwd.isEmpty {
+                projects[conversationID] = cwd
+            }
+        }
+        return projects
     }
 
     private func decodeObject(_ line: String) -> [String: Any]? {
+        if line.utf8.count > 24 * 1024,
+           !line.contains(#""type":"session_meta""#),
+           !line.contains(#""type":"turn_context""#)
+        {
+            return nil
+        }
         guard let data = line.data(using: .utf8) else { return nil }
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
@@ -422,6 +490,9 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
             return toolCallSnippet(name: payload["name"] as? String, arguments: payload["arguments"] ?? payload["input"])
         case "task_complete":
             if let message = payload["last_agent_message"] as? String {
+                if isAdministrativeResult(message) {
+                    return nil
+                }
                 return cleanActivity("Finished: \(message)")
             }
             return "Finished task"
@@ -482,6 +553,24 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
             return "Reviewing screenshot"
         }
 
+        if toolName == "ask_oracle" || toolName.contains("oracle") {
+            return "Consulting context oracle"
+        }
+
+        if toolName.hasPrefix("agent_") {
+            if let object = argumentsObject(from: arguments),
+               let operation = object["op"] as? String
+            {
+                if operation == "start" {
+                    return "Starting delegated agent"
+                }
+                if operation == "wait" {
+                    return "Waiting for delegated agent"
+                }
+            }
+            return "Coordinating delegated agent"
+        }
+
         if let object = argumentsObject(from: arguments) {
             if let command = object["cmd"] as? String ?? object["command"] as? String {
                 return cleanActivity(commandActivitySnippet(command))
@@ -535,8 +624,11 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         if trimmed.hasPrefix("xcodebuild") || trimmed.contains(" xcodebuild ") {
             return "Building app"
         }
+        if trimmed.hasPrefix("sleep ") {
+            return "Waiting"
+        }
         if trimmed.hasPrefix("git ") {
-            return trimmed
+            return gitActivitySnippet(trimmed)
         }
         if trimmed.hasPrefix("screencapture ") {
             return "Capturing screenshot"
@@ -550,18 +642,50 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         return "Running \(trimmed)"
     }
 
+    private func gitActivitySnippet(_ command: String) -> String {
+        if command.hasPrefix("git log ") {
+            return "Inspecting git history"
+        }
+        if command.hasPrefix("git diff") {
+            return "Reviewing code changes"
+        }
+        if command.hasPrefix("git status") {
+            return "Checking git status"
+        }
+        if command.hasPrefix("git push") {
+            return "Pushing branch"
+        }
+        if command.hasPrefix("git commit") {
+            return "Committing changes"
+        }
+        if command.hasPrefix("git add") {
+            return "Staging changes"
+        }
+        return command
+    }
+
+    private func isAdministrativeResult(_ text: String) -> Bool {
+        let compact = text
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\t", with: "")
+        return compact == #"{"outcome":"allow"}"# || compact == #"{"outcome":"deny"}"#
+    }
+
     private func normalizedProjectPath(for kind: AgentKind, cwd: String?, fileURL: URL) -> String? {
-        if let cwd, fileManager.fileExists(atPath: cwd) {
-            return cwd
+        let usableCwd = cwd == "/" ? nil : cwd
+
+        if let usableCwd, fileManager.fileExists(atPath: usableCwd) {
+            return usableCwd
         }
 
         guard kind == .claudeCode else {
-            return cwd
+            return usableCwd
         }
 
         let encodedProject = fileURL.deletingLastPathComponent().lastPathComponent
         let decoded = decodeClaudeProjectPath(encodedProject)
-        return decoded.isEmpty ? cwd : decoded
+        return decoded.isEmpty ? usableCwd : decoded
     }
 
     private func decodeClaudeProjectPath(_ encoded: String) -> String {
@@ -643,6 +767,28 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
         id.count > 10 ? String(id.prefix(8)) : id
     }
 
+    private func shouldReplaceSessionID(_ id: String?) -> Bool {
+        guard let id else { return true }
+        return conversationID(in: id) == nil
+    }
+
+    private func conversationID(in url: URL) -> String? {
+        let filename = url.deletingPathExtension().lastPathComponent
+        return conversationID(in: filename)
+    }
+
+    private func conversationID(in text: String) -> String? {
+        let pattern = #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"#
+        guard
+            let regex = try? NSRegularExpression(pattern: pattern),
+            let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+            let range = Range(match.range, in: text)
+        else {
+            return nil
+        }
+        return String(text[range])
+    }
+
     private static func displayName(forPath path: String) -> String {
         let url = URL(fileURLWithPath: path)
         let last = url.lastPathComponent
@@ -670,6 +816,8 @@ struct ProjectGroup {
     let environment: ProjectEnvironment
     let rows: [ActivityRow]
     let lastUpdatedAt: Date
+    let priorityUpdatedAt: Date
+    let topStatusRank: Int
 }
 
 struct ProjectEnvironment {
@@ -805,16 +953,24 @@ private extension WidgetModel {
                     justFinishedCount: sortedRows.filter { $0.statusHint == .justFinished }.count,
                     sourceSummary: Self.sourceSummary(for: sortedRows),
                     environment: GitEnvironmentReader.snapshot(for: sortedRows.compactMap(\.projectPath).first),
-                    rows: Array(sortedRows.prefix(4)),
-                    lastUpdatedAt: sortedRows.map(\.lastUpdatedAt).max() ?? .distantPast
+                    rows: sortedRows,
+                    lastUpdatedAt: sortedRows.map(\.lastUpdatedAt).max() ?? .distantPast,
+                    priorityUpdatedAt: sortedRows.first?.lastUpdatedAt ?? .distantPast,
+                    topStatusRank: sortedRows.first?.statusHint.sortRank ?? StatusHint.unknown.sortRank
                 )
             }
             .sorted { lhs, rhs in
-                if lhs.inProgressCount != rhs.inProgressCount {
-                    return lhs.inProgressCount > rhs.inProgressCount
+                if lhs.topStatusRank != rhs.topStatusRank {
+                    return lhs.topStatusRank < rhs.topStatusRank
+                }
+                if lhs.priorityUpdatedAt != rhs.priorityUpdatedAt {
+                    return lhs.priorityUpdatedAt > rhs.priorityUpdatedAt
                 }
                 if lhs.justFinishedCount != rhs.justFinishedCount {
                     return lhs.justFinishedCount > rhs.justFinishedCount
+                }
+                if lhs.inProgressCount != rhs.inProgressCount {
+                    return lhs.inProgressCount > rhs.inProgressCount
                 }
                 return lhs.lastUpdatedAt > rhs.lastUpdatedAt
             }
@@ -1022,7 +1178,7 @@ final class DashboardWidgetView: NSView {
         statusColor.setFill()
         NSBezierPath(ovalIn: NSRect(x: bounds.width - 106, y: 25, width: 8, height: 8)).fill()
         drawText(headerStatusLabel(model), rect: NSRect(x: bounds.width - 96, y: 18, width: 78, height: 18), font: .systemFont(ofSize: 13, weight: .semibold), color: Palette.primaryText)
-        drawText("\(model.sessionCount) instances", rect: NSRect(x: bounds.width - 102, y: 38, width: 84, height: 16), font: .systemFont(ofSize: 11), color: Palette.secondaryText)
+        drawHeaderSecondaryStatus(model)
         drawRule(y: 66)
     }
 
@@ -1030,18 +1186,43 @@ final class DashboardWidgetView: NSView {
         var y: CGFloat = 78
         var drawnRows = 0
         let footerTop = bounds.height - 42
-        for group in model.groups.prefix(4) {
+        let activeGroupCount = model.groups.filter { $0.inProgressCount > 0 }.count
+        for group in visibleGroups(model) {
             guard y + 42 < footerTop else { return }
             drawGroupHeader(group, y: y)
             y += 42
 
-            for row in group.rows {
+            for row in visibleRows(for: group, activeGroupCount: activeGroupCount) {
                 guard drawnRows < 6, y + 44 < footerTop else { return }
                 drawRow(row, y: y)
                 y += 44
                 drawnRows += 1
             }
         }
+    }
+
+    private func visibleGroups(_ model: WidgetModel) -> [ProjectGroup] {
+        let runningGroups = model.groups.filter { $0.inProgressCount > 0 }
+        let otherGroups = model.groups.filter { $0.inProgressCount == 0 }
+        return Array((runningGroups + otherGroups).prefix(4))
+    }
+
+    private func visibleRows(for group: ProjectGroup, activeGroupCount: Int) -> [ActivityRow] {
+        let runningRows = group.rows.filter { $0.statusHint == .inProgress }
+        let justFinishedRows = group.rows.filter { $0.statusHint == .justFinished }
+        let doneRows = group.rows.filter { $0.statusHint == .done }
+
+        guard !runningRows.isEmpty else {
+            return Array((justFinishedRows + doneRows).prefix(1))
+        }
+
+        let runningLimit = activeGroupCount >= 3 ? 1 : 2
+        var rows = Array(runningRows.prefix(runningLimit))
+        let finishedLimit = activeGroupCount <= 1 ? max(0, 3 - rows.count) : max(0, 2 - rows.count)
+        if finishedLimit > 0 {
+            rows.append(contentsOf: justFinishedRows.prefix(finishedLimit))
+        }
+        return rows
     }
 
     private func drawGroupHeader(_ group: ProjectGroup, y: CGFloat) {
@@ -1081,6 +1262,17 @@ final class DashboardWidgetView: NSView {
         if model.inProgressCount > 0 { return Palette.green }
         if model.justFinishedCount > 0 { return Palette.amber }
         return Palette.mutedText
+    }
+
+    private func drawHeaderSecondaryStatus(_ model: WidgetModel) {
+        if model.justFinishedCount > 0 {
+            Palette.amber.setFill()
+            NSBezierPath(ovalIn: NSRect(x: bounds.width - 106, y: 45, width: 8, height: 8)).fill()
+            drawText("\(model.justFinishedCount) finished", rect: NSRect(x: bounds.width - 96, y: 38, width: 78, height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: Palette.secondaryText)
+            return
+        }
+
+        drawText("\(model.sessionCount) instances", rect: NSRect(x: bounds.width - 102, y: 38, width: 84, height: 16), font: .systemFont(ofSize: 11), color: Palette.secondaryText)
     }
 
     private func groupStatusLabel(_ group: ProjectGroup) -> String {

@@ -7,6 +7,7 @@ The current app is intentionally small and glanceable: it opens as a floating `N
 ## What it shows
 
 - running, just-finished, and done local agent instance counts
+- a priority view that keeps running projects represented before extra finished rows
 - projects in motion, sorted by activity
 - per-project Codex and Claude Code instances
 - prompt/session labels from session metadata
