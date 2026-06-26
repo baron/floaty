@@ -410,6 +410,7 @@ final class LocalSessionSnapshotProvider: DashboardSnapshotProviding {
 struct ActivityRow {
     let source: String
     let project: String
+    let projectPath: String?
     let title: String
     let instance: String
     let status: String
@@ -422,8 +423,21 @@ struct ProjectGroup {
     let project: String
     let activeCount: Int
     let sourceSummary: String
+    let environment: ProjectEnvironment
     let rows: [ActivityRow]
     let lastUpdatedAt: Date
+}
+
+struct ProjectEnvironment {
+    let location: String
+    let branch: String?
+    let changedFiles: Int
+    let insertions: Int
+    let deletions: Int
+
+    var isDirty: Bool {
+        changedFiles > 0 || insertions > 0 || deletions > 0
+    }
 }
 
 struct WidgetModel {
@@ -521,6 +535,7 @@ private extension WidgetModel {
             ActivityRow(
                 source: session.agentKind.displayName,
                 project: session.projectName,
+                projectPath: session.projectPath,
                 title: session.title,
                 instance: session.instanceID ?? "",
                 status: session.statusHint.displayName,
@@ -542,6 +557,7 @@ private extension WidgetModel {
                     project: project,
                     activeCount: sortedRows.filter(\.isActive).count,
                     sourceSummary: Self.sourceSummary(for: sortedRows),
+                    environment: GitEnvironmentReader.snapshot(for: sortedRows.compactMap(\.projectPath).first),
                     rows: Array(sortedRows.prefix(4)),
                     lastUpdatedAt: sortedRows.map(\.lastUpdatedAt).max() ?? .distantPast
                 )
@@ -585,6 +601,99 @@ private extension WidgetModel {
         return "\(hours / 24)d"
     }
 
+}
+
+private enum GitEnvironmentReader {
+    private static let cacheInterval: TimeInterval = 20
+    private static var cache: [String: (snapshot: ProjectEnvironment, capturedAt: Date)] = [:]
+
+    static func snapshot(for projectPath: String?) -> ProjectEnvironment {
+        guard
+            let projectPath,
+            !projectPath.isEmpty,
+            FileManager.default.fileExists(atPath: projectPath)
+        else {
+            return ProjectEnvironment(location: "Local", branch: nil, changedFiles: 0, insertions: 0, deletions: 0)
+        }
+
+        if
+            let cached = cache[projectPath],
+            Date().timeIntervalSince(cached.capturedAt) < cacheInterval
+        {
+            return cached.snapshot
+        }
+
+        guard let root = runGit(["-C", projectPath, "rev-parse", "--show-toplevel"]).nonEmptyTrimmed else {
+            return ProjectEnvironment(location: "Local", branch: nil, changedFiles: 0, insertions: 0, deletions: 0)
+        }
+
+        if
+            let cached = cache[root],
+            Date().timeIntervalSince(cached.capturedAt) < cacheInterval
+        {
+            cache[projectPath] = cached
+            return cached.snapshot
+        }
+
+        let branch = runGit(["-C", root, "symbolic-ref", "--quiet", "--short", "HEAD"]).nonEmptyTrimmed
+            ?? runGit(["-C", root, "rev-parse", "--short", "HEAD"]).nonEmptyTrimmed
+        let status = runGit(["-C", root, "status", "--porcelain=v1", "--untracked-files=no"])
+        let shortstat = runGit(["-C", root, "diff", "--shortstat", "HEAD"])
+
+        let snapshot = ProjectEnvironment(
+            location: "Local",
+            branch: branch,
+            changedFiles: status.split(separator: "\n", omittingEmptySubsequences: true).count,
+            insertions: captureInt(in: shortstat, pattern: #"([0-9,]+) insertion"#),
+            deletions: captureInt(in: shortstat, pattern: #"([0-9,]+) deletion"#)
+        )
+        let entry = (snapshot: snapshot, capturedAt: Date())
+        cache[projectPath] = entry
+        cache[root] = entry
+        return snapshot
+    }
+
+    private static func runGit(_ arguments: [String]) -> String {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["--no-optional-locks"] + arguments
+        process.standardOutput = output
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return ""
+        }
+
+        guard process.terminationStatus == 0 else {
+            return ""
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private static func captureInt(in text: String, pattern: String) -> Int {
+        guard
+            let regex = try? NSRegularExpression(pattern: pattern),
+            let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+            let range = Range(match.range(at: 1), in: text)
+        else {
+            return 0
+        }
+
+        let digits = text[range].replacingOccurrences(of: ",", with: "")
+        return Int(digits) ?? 0
+    }
+}
+
+private extension String {
+    var nonEmptyTrimmed: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 }
 
 final class DashboardWidgetView: NSView {
@@ -670,12 +779,12 @@ final class DashboardWidgetView: NSView {
         var drawnRows = 0
         let footerTop = bounds.height - 42
         for group in model.groups.prefix(4) {
-            guard y + 30 < footerTop else { return }
+            guard y + 42 < footerTop else { return }
             drawGroupHeader(group, y: y)
-            y += 30
+            y += 42
 
             for row in group.rows {
-                guard drawnRows < 7, y + 44 < footerTop else { return }
+                guard drawnRows < 6, y + 44 < footerTop else { return }
                 drawRow(row, y: y)
                 y += 44
                 drawnRows += 1
@@ -684,10 +793,14 @@ final class DashboardWidgetView: NSView {
     }
 
     private func drawGroupHeader(_ group: ProjectGroup, y: CGFloat) {
-        drawText(group.project, rect: NSRect(x: 20, y: y, width: 168, height: 16), font: .systemFont(ofSize: 12, weight: .bold), color: Palette.primaryText)
-        drawText(group.sourceSummary, rect: NSRect(x: 20, y: y + 16, width: 170, height: 13), font: .systemFont(ofSize: 10.5, weight: .medium), color: Palette.secondaryText)
+        drawText(group.project, rect: NSRect(x: 20, y: y, width: 164, height: 18), font: .systemFont(ofSize: 13, weight: .bold), color: Palette.primaryText)
         let label = group.activeCount > 0 ? "\(group.activeCount) active" : "\(group.rows.count) recent"
         drawText(label, rect: NSRect(x: bounds.width - 92, y: y + 3, width: 74, height: 15), font: .systemFont(ofSize: 11, weight: .semibold), color: group.activeCount > 0 ? Palette.green : Palette.secondaryText)
+
+        let branch = group.environment.branch ?? "no git"
+        let context = "\(group.sourceSummary)  \(group.environment.location)  \(branch)"
+        drawText(context, rect: NSRect(x: 20, y: y + 18, width: bounds.width - 132, height: 15), font: .systemFont(ofSize: 10.5, weight: .medium), color: Palette.secondaryText)
+        drawChangeSummary(group.environment, y: y + 18)
     }
 
     private func drawRow(_ row: ActivityRow, y: CGFloat) {
@@ -713,6 +826,22 @@ final class DashboardWidgetView: NSView {
         }
     }
 
+    private func drawChangeSummary(_ environment: ProjectEnvironment, y: CGFloat) {
+        if environment.insertions > 0 || environment.deletions > 0 {
+            let deletions = "-\(Self.formattedCount(environment.deletions))"
+            let deletionWidth = textWidth(deletions, font: .monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold))
+            drawText(deletions, rect: NSRect(x: bounds.width - 18 - deletionWidth, y: y, width: deletionWidth, height: 15), font: .monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold), color: Palette.red)
+
+            let insertions = "+\(Self.formattedCount(environment.insertions))"
+            let insertionWidth = textWidth(insertions, font: .monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold))
+            drawText(insertions, rect: NSRect(x: bounds.width - 26 - deletionWidth - insertionWidth, y: y, width: insertionWidth, height: 15), font: .monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold), color: Palette.green)
+            return
+        }
+
+        let text = environment.changedFiles > 0 ? "\(environment.changedFiles) files" : "clean"
+        drawText(text, rect: NSRect(x: bounds.width - 76, y: y, width: 58, height: 15), font: .systemFont(ofSize: 10.5, weight: .semibold), color: environment.isDirty ? Palette.warning : Palette.secondaryText)
+    }
+
     private func drawRule(y: CGFloat) {
         Palette.hairline.setStroke()
         let path = NSBezierPath()
@@ -733,12 +862,23 @@ final class DashboardWidgetView: NSView {
         (text as NSString).draw(in: rect, withAttributes: attributes)
     }
 
+    private func textWidth(_ text: String, font: NSFont) -> CGFloat {
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        return ceil((text as NSString).size(withAttributes: attributes).width)
+    }
+
     private func cgColor(for color: NSColor) -> CGColor {
         var output = color.cgColor
         effectiveAppearance.performAsCurrentDrawingAppearance {
             output = color.cgColor
         }
         return output
+    }
+
+    private static func formattedCount(_ count: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: count)) ?? "\(count)"
     }
 }
 
@@ -767,6 +907,10 @@ private enum Palette {
     static let green = adaptive(
         light: NSColor(calibratedRed: 0.00, green: 0.62, blue: 0.32, alpha: 1),
         dark: NSColor(calibratedRed: 0.25, green: 0.86, blue: 0.50, alpha: 1)
+    )
+    static let red = adaptive(
+        light: NSColor(calibratedRed: 0.80, green: 0.12, blue: 0.16, alpha: 1),
+        dark: NSColor(calibratedRed: 1.00, green: 0.30, blue: 0.33, alpha: 1)
     )
     static let warning = adaptive(
         light: NSColor.systemOrange,

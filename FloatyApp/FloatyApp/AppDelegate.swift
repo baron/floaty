@@ -28,7 +28,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        windowController?.toggleVisibility()
+        return false
     }
 }
 
@@ -58,6 +63,19 @@ final class FloatyWindowController: NSWindowController {
         panel.standardWindowButton(.zoomButton)?.isHidden = true
 
         super.init(window: panel)
+    }
+
+    func toggleVisibility() {
+        guard let window else { return }
+        if window.isVisible {
+            window.orderOut(nil)
+            return
+        }
+
+        showWindow(nil)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @available(*, unavailable)
