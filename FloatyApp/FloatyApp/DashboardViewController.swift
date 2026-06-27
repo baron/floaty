@@ -1265,7 +1265,7 @@ final class DashboardWidgetView: NSView {
     }
 
     private func drawHeaderSecondaryStatus(_ model: WidgetModel) {
-        if model.justFinishedCount > 0 {
+        if model.inProgressCount > 0 && model.justFinishedCount > 0 {
             Palette.amber.setFill()
             NSBezierPath(ovalIn: NSRect(x: bounds.width - 106, y: 45, width: 8, height: 8)).fill()
             drawText("\(model.justFinishedCount) finished", rect: NSRect(x: bounds.width - 96, y: 38, width: 78, height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: Palette.secondaryText)
