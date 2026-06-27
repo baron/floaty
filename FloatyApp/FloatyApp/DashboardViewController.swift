@@ -1174,10 +1174,8 @@ final class DashboardWidgetView: NSView {
         drawText("Floaty", rect: NSRect(x: 20, y: 18, width: 95, height: 24), font: .systemFont(ofSize: 17, weight: .semibold), color: Palette.primaryText)
         drawText("local sessions", rect: NSRect(x: 20, y: 40, width: 120, height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: Palette.secondaryText)
 
-        let statusColor = headerStatusColor(model)
-        statusColor.setFill()
-        NSBezierPath(ovalIn: NSRect(x: bounds.width - 106, y: 25, width: 8, height: 8)).fill()
-        drawText(headerStatusLabel(model), rect: NSRect(x: bounds.width - 96, y: 18, width: 78, height: 18), font: .systemFont(ofSize: 13, weight: .semibold), color: Palette.primaryText)
+        let summaryRect = NSRect(x: bounds.width - 142, y: 18, width: 122, height: 18)
+        drawRightText(headerStatusLabel(model), rect: summaryRect, font: .systemFont(ofSize: 13, weight: .semibold), color: headerStatusColor(model))
         drawHeaderSecondaryStatus(model)
         drawRule(y: 66)
     }
@@ -1265,14 +1263,19 @@ final class DashboardWidgetView: NSView {
     }
 
     private func drawHeaderSecondaryStatus(_ model: WidgetModel) {
-        if model.inProgressCount > 0 && model.justFinishedCount > 0 {
-            Palette.amber.setFill()
-            NSBezierPath(ovalIn: NSRect(x: bounds.width - 106, y: 45, width: 8, height: 8)).fill()
-            drawText("\(model.justFinishedCount) finished", rect: NSRect(x: bounds.width - 96, y: 38, width: 78, height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: Palette.secondaryText)
-            return
-        }
+        drawRightText(
+            headerSecondaryLabel(model),
+            rect: NSRect(x: bounds.width - 142, y: 38, width: 122, height: 16),
+            font: .systemFont(ofSize: 11, weight: .medium),
+            color: Palette.secondaryText
+        )
+    }
 
-        drawText("\(model.sessionCount) instances", rect: NSRect(x: bounds.width - 102, y: 38, width: 84, height: 16), font: .systemFont(ofSize: 11), color: Palette.secondaryText)
+    private func headerSecondaryLabel(_ model: WidgetModel) -> String {
+        if model.inProgressCount > 0 && model.justFinishedCount > 0 {
+            return "\(model.justFinishedCount) finished / \(model.sessionCount) total"
+        }
+        return "\(model.sessionCount) total"
     }
 
     private func groupStatusLabel(_ group: ProjectGroup) -> String {
@@ -1346,6 +1349,18 @@ final class DashboardWidgetView: NSView {
     private func drawText(_ text: String, rect: NSRect, font: NSFont, color: NSColor) {
         let style = NSMutableParagraphStyle()
         style.lineBreakMode = .byTruncatingTail
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: color,
+            .paragraphStyle: style
+        ]
+        (text as NSString).draw(in: rect, withAttributes: attributes)
+    }
+
+    private func drawRightText(_ text: String, rect: NSRect, font: NSFont, color: NSColor) {
+        let style = NSMutableParagraphStyle()
+        style.alignment = .right
+        style.lineBreakMode = .byTruncatingHead
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: color,
