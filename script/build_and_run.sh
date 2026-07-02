@@ -13,6 +13,19 @@ BUNDLE_ID="dev.floaty.widget"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+if [[ "$MODE" == "--hermes-fixtures" || "$MODE" == "hermes-fixtures" ]]; then
+  mkdir -p build
+  swiftc \
+    FloatyApp/FloatyApp/SceneDelegate.swift \
+    FloatyApp/FloatyApp/AppKitWindowBridge.swift \
+    FloatyApp/FloatyApp/DashboardViewController.swift \
+    script/hermes_fixture_test.swift \
+    -lsqlite3 \
+    -o build/floaty_hermes_fixture_test
+  build/floaty_hermes_fixture_test
+  exit 0
+fi
+
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 
 xcodebuild \
@@ -48,7 +61,7 @@ case "$MODE" in
     pgrep -x "$APP_NAME" >/dev/null
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--hermes-fixtures]" >&2
     exit 2
     ;;
 esac

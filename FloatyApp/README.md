@@ -9,7 +9,7 @@ The current app is intentionally small and glanceable: it opens as a floating `N
 - running, just-finished, and done local agent instance counts
 - a priority view that keeps running projects represented before extra finished rows
 - projects in motion, sorted by activity
-- per-project Codex and Claude Code instances
+- per-project Codex, Claude Code, and Hermes instances
 - prompt/session labels from session metadata
 - motion-aware status from live process state and file modification changes
 - watched local source roots
@@ -21,8 +21,11 @@ The current app is intentionally small and glanceable: it opens as a floating `N
 - `~/.codex/sessions`
 - `~/.claude/projects`
 - `~/.codex/process_manager/chat_processes.json`
+- `~/.hermes/state.db` (SQLite/WAL, read-only)
 
-The provider reads bounded metadata from recent JSONL files, groups sessions by project, filters stale/unknown sessions out of the floating UI, and uses live Codex process-manager pids plus file modification movement to separate in-progress, just-finished, and done work.
+The provider reads bounded metadata from recent Codex/Claude JSONL files plus recent Hermes rows from the current `sessions`/`messages` schema contract (`schema_version >= 16`, session id/title/cwd/git repo root/timestamps and latest message timestamp/content). Missing, busy, or schema-mismatched Hermes state is reported as a non-fatal warning so Codex/Claude rows keep rendering.
+
+Rust parity follow-up: when the Rust FFI-backed provider replaces this Swift-local path, add Hermes discovery config and a parser for the same `~/.hermes/state.db` schema instead of duplicating a second runtime source.
 
 ## App icon
 
